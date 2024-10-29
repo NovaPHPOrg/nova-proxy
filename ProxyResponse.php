@@ -9,7 +9,27 @@ class ProxyResponse extends Response
 {
     private string $uri;
     private array $socketConfig;
-    
+
+    private $callback = null;
+
+    const int READ_BYTES = 4096;
+
+    private $errorHandler = null;
+
+    function setErrorHandler(callable $err)
+    {
+        $this->errorHandler = $err;
+        return $this;
+    }
+
+    function setReceiveCallback(callable $callback)
+    {
+        $this->callback = $callback;
+        return $this;
+
+    }
+
+
     public function __construct(string $uri)
     {
         $this->uri = $uri;
@@ -27,7 +47,15 @@ class ProxyResponse extends Response
      */
     public function send(): void
     {
-        $this->forwardRequest($this->uri);
+        try {
+            $this->forwardRequest($this->uri);
+        }catch (\Exception $exception){
+            if ($this->errorHandler && is_callable($this->errorHandler)){
+                call_user_func($this->errorHandler,$exception);
+            }else{
+                throw $exception;
+            }
+        }
     }
 
     /**
@@ -37,10 +65,10 @@ class ProxyResponse extends Response
     {
         $urlInfo = $this->parseAndValidateUrl($targetUri);
         $socket = $this->createConnection($urlInfo);
-        
+
         try {
             $request = $this->buildRequest($urlInfo);
-            Logger::warning("request:".$request);
+            Logger::info("request:" . $request);
             $this->sendRequest($socket, $request);
             $this->receiveResponse($socket);
         } finally {
@@ -73,8 +101,8 @@ class ProxyResponse extends Response
     private function createConnection(array $urlInfo)
     {
         $context = stream_context_create($this->socketConfig);
-        $connectionString = ($urlInfo['scheme'] === 'https' ? 'ssl://' : 'tcp://') . 
-                          $urlInfo['host'] . ':' . $urlInfo['port'];
+        $connectionString = ($urlInfo['scheme'] === 'https' ? 'ssl://' : 'tcp://') .
+            $urlInfo['host'] . ':' . $urlInfo['port'];
 
         $socket = stream_socket_client(
             $connectionString,
@@ -128,23 +156,27 @@ class ProxyResponse extends Response
     {
         // 读取并处理响应头
         $headerComplete = false;
-        $header = '';
-        
+
         while (!$headerComplete && !feof($socket)) {
             $line = fgets($socket);
             if ($line === "\r\n") {
                 $headerComplete = true;
             } else {
-                $header .= $line;
                 if (!empty(trim($line))) {
                     header(trim($line));
                 }
             }
         }
 
+
         // 直接将响应体输出到浏览器
         while (!feof($socket)) {
-            echo fread($socket, 8192);
+            if ($this->callback != null && is_callable($this->callback)) {
+                $callback = $this->callback;
+                echo $callback(fread($socket, ProxyResponse::READ_BYTES));
+            } else {
+                echo fread($socket, ProxyResponse::READ_BYTES);
+            }
             flush();
         }
     }
