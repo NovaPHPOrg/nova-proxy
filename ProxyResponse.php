@@ -4,17 +4,36 @@ namespace nova\plugin\proxy;
 
 use nova\framework\log\Logger;
 use nova\framework\request\Response;
+use function nova\framework\dump;
 
 class ProxyResponse extends Response
 {
     private string $uri;
     private array $socketConfig;
-
-    private $callback = null;
+    /**
+     * @var callable $responseBodyHandler
+     */
+    private $responseBodyHandler = null;
+    private array $responseBodyUris = [];
+    /**
+     * @var callable $responseHandler
+     */
+    private $responseHandler = null;
 
     const int READ_BYTES = 4096;
-
+    /**
+     * @var callable $errorHandler
+     */
     private $errorHandler = null;
+
+    private int $timeout = 30;
+
+    function setTimeout($timeout)
+    {
+        $this->timeout = $timeout;
+        return $this;
+    }
+
 
     function setErrorHandler(callable $err)
     {
@@ -22,13 +41,18 @@ class ProxyResponse extends Response
         return $this;
     }
 
-    function setReceiveCallback(callable $callback)
+    function setResponseBodyHandler(callable $callback,array $uris = [])
     {
-        $this->callback = $callback;
+        $this->responseBodyHandler = $callback;
+        $this->responseBodyUris = $uris;
         return $this;
-
     }
 
+    function setResponseHandler(callable $handler)
+    {
+        $this->responseHandler = $handler;
+        return $this;
+    }
 
     public function __construct(string $uri)
     {
@@ -49,10 +73,10 @@ class ProxyResponse extends Response
     {
         try {
             $this->forwardRequest($this->uri);
-        }catch (\Exception $exception){
-            if ($this->errorHandler && is_callable($this->errorHandler)){
-                call_user_func($this->errorHandler,$exception);
-            }else{
+        } catch (\Exception $exception) {
+            if ($this->errorHandler && is_callable($this->errorHandler)) {
+                call_user_func($this->errorHandler, $exception);
+            } else {
                 throw $exception;
             }
         }
@@ -76,6 +100,8 @@ class ProxyResponse extends Response
         }
     }
 
+    private string $path = "";
+
     /**
      * @throws ProxyException
      */
@@ -83,14 +109,16 @@ class ProxyResponse extends Response
     {
         $parsedUrl = parse_url($url);
         if ($parsedUrl === false || !isset($parsedUrl['scheme']) || !isset($parsedUrl['host'])) {
-            throw new ProxyException("无效的URL格式");
+            throw new ProxyException("无效的URL格式：$url");
         }
+
+        $this->path = $parsedUrl['path'] ?? '/';
 
         return [
             'scheme' => strtolower($parsedUrl['scheme']),
             'host' => $parsedUrl['host'],
             'port' => $parsedUrl['port'] ?? ($parsedUrl['scheme'] === 'https' ? 443 : 80),
-            'path' => $parsedUrl['path'] ?? '/',
+            'path' =>  $this->path,
             'query' => isset($parsedUrl['query']) ? '?' . $parsedUrl['query'] : '',
         ];
     }
@@ -108,7 +136,7 @@ class ProxyResponse extends Response
             $connectionString,
             $errno,
             $errstr,
-            30,
+            $this->timeout,
             STREAM_CLIENT_CONNECT,
             $context
         );
@@ -156,6 +184,7 @@ class ProxyResponse extends Response
     {
         // 读取并处理响应头
         $headerComplete = false;
+        $responseHeaders = [];
 
         while (!$headerComplete && !feof($socket)) {
             $line = fgets($socket);
@@ -163,34 +192,52 @@ class ProxyResponse extends Response
                 $headerComplete = true;
             } else {
                 if (!empty(trim($line))) {
+                    $responseHeaders[] = trim($line);
                     header(trim($line));
                 }
             }
         }
 
+        // 调用响应处理器
+        if ($this->responseHandler && is_callable($this->responseHandler)) {
+            call_user_func($this->responseHandler, $responseHeaders);
+        }
+
+        $body = "";
+
+        $isResponseBodyHandler =
+            $this->responseBodyHandler &&
+            is_callable($this->responseBodyHandler) &&
+            $this->responseBodyUris;
+        if ($isResponseBodyHandler){
+            $isResponseBodyHandler = false;
+            foreach ($this->responseBodyUris as $uri){
+                if (str_contains($this->path,$uri)){
+                    $isResponseBodyHandler = true;
+                    break;
+                }
+            }
+        }
 
         // 直接将响应体输出到浏览器
         while (!feof($socket)) {
-            if ($this->callback != null && is_callable($this->callback)) {
-                $callback = $this->callback;
-                echo $callback(fread($socket, ProxyResponse::READ_BYTES));
-            } else {
-                echo fread($socket, ProxyResponse::READ_BYTES);
+            $data = fread($socket, ProxyResponse::READ_BYTES);
+            if ($isResponseBodyHandler){
+                $body .= $data;
+            }else{
+                echo $data;
+                flush();
             }
+        }
+
+        Logger::info($body);
+
+        if ($isResponseBodyHandler){
+            echo call_user_func($this->responseBodyHandler, $body,$this->path);
             flush();
         }
     }
 
-    private function handleResponse(string $response): void
-    {
-        list($header, $body) = explode("\r\n\r\n", $response, 2);
-        foreach (explode("\r\n", $header) as $line) {
-            if (!empty($line)) {
-                header($line);
-            }
-        }
-        echo $body;
-    }
 
     private function closeConnection($socket): void
     {
