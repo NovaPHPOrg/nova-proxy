@@ -1,4 +1,7 @@
 <?php
+
+declare(strict_types=1);
+
 /*
  * Copyright (c) 2025. Lorem ipsum dolor sit amet, consectetur adipiscing elit.
  * Morbi non lorem porttitor neque feugiat blandit. Ut vitae ipsum eget quam lacinia accumsan.
@@ -11,7 +14,6 @@ namespace nova\plugin\proxy;
 
 use nova\framework\log\Logger;
 use nova\framework\request\Response;
-use function nova\framework\dump;
 
 class ProxyResponse extends Response
 {
@@ -27,7 +29,7 @@ class ProxyResponse extends Response
      */
     private $responseHandler = null;
 
-    const int READ_BYTES = 4096;
+    public const int READ_BYTES = 4096;
     /**
      * @var callable $errorHandler
      */
@@ -35,27 +37,26 @@ class ProxyResponse extends Response
 
     private int $timeout = 30;
 
-    function setTimeout($timeout)
+    public function setTimeout($timeout)
     {
         $this->timeout = $timeout;
         return $this;
     }
 
-
-    function setErrorHandler(callable $err)
+    public function setErrorHandler(callable $err)
     {
         $this->errorHandler = $err;
         return $this;
     }
 
-    function setResponseBodyHandler(callable $callback,array $uris = [])
+    public function setResponseBodyHandler(callable $callback, array $uris = [])
     {
         $this->responseBodyHandler = $callback;
         $this->responseBodyUris = $uris;
         return $this;
     }
 
-    function setResponseHandler(callable $handler)
+    public function setResponseHandler(callable $handler)
     {
         $this->responseHandler = $handler;
         return $this;
@@ -216,10 +217,10 @@ class ProxyResponse extends Response
             $this->responseBodyHandler &&
             is_callable($this->responseBodyHandler) &&
             $this->responseBodyUris;
-        if ($isResponseBodyHandler){
+        if ($isResponseBodyHandler) {
             $isResponseBodyHandler = false;
-            foreach ($this->responseBodyUris as $uri){
-                if (str_contains($this->path,$uri)){
+            foreach ($this->responseBodyUris as $uri) {
+                if (str_contains($this->path, $uri)) {
                     $isResponseBodyHandler = true;
                     break;
                 }
@@ -229,9 +230,9 @@ class ProxyResponse extends Response
         // 直接将响应体输出到浏览器
         while (!feof($socket)) {
             $data = fread($socket, ProxyResponse::READ_BYTES);
-            if ($isResponseBodyHandler){
+            if ($isResponseBodyHandler) {
                 $body .= $data;
-            }else{
+            } else {
                 echo $data;
                 flush();
             }
@@ -239,12 +240,11 @@ class ProxyResponse extends Response
 
         Logger::info($body);
 
-        if ($isResponseBodyHandler){
-            echo call_user_func($this->responseBodyHandler, $body,$this->path);
+        if ($isResponseBodyHandler) {
+            echo call_user_func($this->responseBodyHandler, $body, $this->path);
             flush();
         }
     }
-
 
     private function closeConnection($socket): void
     {
