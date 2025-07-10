@@ -197,37 +197,112 @@ class ProxyResponse extends Response
 
     private function receiveResponse($socket): void
     {
-        /* ---------- 透传响应头 ---------- */
-        $rawHost   = $this->getDomain($this->uri);
-        $replHost  = $this->getDomain($this->domain);
-        $headers   = [];
+        $rawHost  = $this->getDomain($this->uri);
+        $replHost = $this->getDomain($this->domain);
 
+        $isChunked = false;
+        $isGzip    = false;
+        $hdrSent   = [];
+
+        /* ---------- 读取并处理响应头 ---------- */
         while (!feof($socket)) {
             $line = fgets($socket);
-            if ($line === "\r\n") break;
+            if ($line === "\r\n") {
+                break;                             // 头结束
+            }
 
             $trim = trim($line);
-            if ($trim !== '') {
-                $hdr = str_replace($rawHost, $replHost, $trim);
-                header($hdr);
-                $headers[] = $hdr;
+            if ($trim === '') continue;
+
+            // Transfer-Encoding: chunked  —— 不下发，标记后续解码
+            if (stripos($trim, 'Transfer-Encoding:') === 0 &&
+                stripos($trim, 'chunked')           !== false) {
+                $isChunked = true;
+                continue;
             }
+
+            // Content-Encoding: gzip —— 标记，稍后可能换新的
+            if (stripos($trim, 'Content-Encoding:') === 0 &&
+                stripos($trim, 'gzip')             !== false) {
+                $isGzip = true;
+                // 先不发送，等主体处理完后再决定
+                continue;
+            }
+
+            // 其余头：做域名替换后立即透传
+            $hdr = str_replace($rawHost, $replHost, $trim);
+            header($hdr);
+            $hdrSent[] = $hdr;
         }
 
-        /* ---------- 读取响应体 ---------- */
+        /* ---------- 读取主体 ---------- */
         $body = '';
         while (!feof($socket)) {
             $body .= fread($socket, self::READ_BYTES);
         }
+
+        /* ---------- 分块解码 ---------- */
+        if ($isChunked) {
+            $body = $this->decodeChunked($body);
+        }
+
+        /* ---------- gzip 解压，用于文本替换 / 注入 ---------- */
+        if ($isGzip) {
+            $decoded = @gzdecode($body);
+            // 如果解压失败就保留原样
+            if ($decoded !== false) {
+                $body = $decoded;
+            }
+        }
+
+        /* ---------- 域名替换 + 自定义注入 ---------- */
         $body = str_replace($rawHost, $replHost, $body);
 
         if ($this->responseInjector) {
-            $body = ($this->responseInjector)($body, $headers, $this->path);
+            $body = ($this->responseInjector)(
+                $body,
+                $hdrSent,
+                $this->path
+            );
         }
 
+        /* ---------- 如有 gzip 重新压回去 ---------- */
+        if ($isGzip) {
+            $body = gzencode($body);
+            header('Content-Encoding: gzip', true);          // replace/add
+        } else {
+            // 确保没把上游的 gzip 头遗漏
+            header_remove('Content-Encoding');
+        }
+
+        /* ---------- 重新发送正确的长度 ---------- */
+        header('Content-Length: ' . strlen($body), true);
+
+        /* ---------- 输出 ---------- */
         echo $body;
         flush();
     }
+
+
+    /**
+     * 把 “块长度\r\n数据\r\n” 形式的数据解包成纯正文
+     */
+    private function decodeChunked(string $data): string
+    {
+        $out = '';
+        while ($data !== '') {
+            // 找 CRLF 之前的长度字段
+            if (($pos = strpos($data, "\r\n")) === false) break;
+            $lenHex = trim(substr($data, 0, $pos));
+            $len    = hexdec($lenHex);
+            if ($len === 0) break;                       // “0\r\n\r\n” 结束
+            $out  .= substr($data, $pos + 2, $len);       // 取出完整块
+            // 跳过 “len\r\n……数据……\r\n”
+            $data  = substr($data, $pos + 2 + $len + 2);
+        }
+        return $out;
+    }
+
 
     private function closeConnection($socket): void
     {
