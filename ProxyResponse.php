@@ -1,5 +1,4 @@
 <?php
-
 declare(strict_types=1);
 
 namespace nova\plugin\proxy;
@@ -10,32 +9,36 @@ use nova\framework\http\Response;
 class ProxyResponse extends Response
 {
     private string $uri;
-    private array $socketConfig;
-    private string $path = "";
+    private array  $socketConfig;
+    private string $path = '';
 
     /** @var callable|null (string $rawRequest, array $urlInfo): array */
     private $requestInterceptor = null;
 
     /** @var callable|null (string $respBody, array $respHeaders, string $path): string */
-    private $responseInjector = null;
+    private $responseInjector  = null;
 
-    /** @var callable|null (\Exception $exception): void */
-    private $errorHandler = null;
+    /** @var callable|null (\Throwable $exception): void */
+    private $errorHandler      = null;
+
     public const int READ_BYTES = 4096;
-    private int $timeout = 30;
+    private int  $timeout = 30;
+    private string $domain = '';
 
-    public function __construct(string $uri)
+    public function __construct(string $uri, string $domain)
     {
         parent::__construct();
 
-        $this->uri = $uri;
+        $this->uri   = $uri;
+        $this->domain = $domain;
         $this->socketConfig = [
-            'ssl' => [
-                'verify_peer'       => false,
-                'verify_peer_name'  => false,
-            ],
+            'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
         ];
     }
+
+    /* ------------------------------------------------------------------ */
+    /*               Public helpers (chain-style setters)                 */
+    /* ------------------------------------------------------------------ */
 
     public function setTimeout(int $timeout): self
     {
@@ -49,26 +52,23 @@ class ProxyResponse extends Response
         return $this;
     }
 
-    /**
-     * @param callable (string $rawRequest, array $urlInfo): array $callback
-     * @return ProxyResponse
-     */
-    public function setRequestInterceptor(callable $callback): self
+    /** @param callable (string $rawRequest, array $urlInfo): array $cb */
+    public function setRequestInterceptor(callable $cb): self
     {
-        $this->requestInterceptor = $callback;
+        $this->requestInterceptor = $cb;
         return $this;
     }
 
-    /**
-     * @param callable (string $respBody, array $respHeaders, string $path): string  $callback
-     * @return $this
-     */
-    public function setResponseInjector(callable $callback): self
+    /** @param callable (string $body, array $headers, string $path): string $cb */
+    public function setResponseInjector(callable $cb): self
     {
-        $this->responseInjector = $callback;
+        $this->responseInjector = $cb;
         return $this;
     }
 
+    /* ------------------------------------------------------------------ */
+    /*                               Entry                                */
+    /* ------------------------------------------------------------------ */
 
     /**
      * @throws ProxyException
@@ -76,15 +76,28 @@ class ProxyResponse extends Response
     public function send(): void
     {
         try {
+            // *** WS GUARD: 拒绝 WebSocket 升级 & ws / wss 目标
+            if ($this->isWebSocketRequest()) {
+                header('HTTP/1.1 501 Not Implemented');
+                header('Content-Type: text/plain; charset=utf-8');
+                echo 'WebSocket is not supported by this proxy.';
+                flush();
+                return;
+            }
+
             $this->forwardRequest($this->uri);
-        } catch (\Throwable $exception) {
+        } catch (\Throwable $e) {
             if ($this->errorHandler) {
-                call_user_func($this->errorHandler, $exception);
+                ($this->errorHandler)($e);
             } else {
-                throw $exception;
+                throw $e;
             }
         }
     }
+
+    /* ------------------------------------------------------------------ */
+    /*                          Core forwarding                           */
+    /* ------------------------------------------------------------------ */
 
     /**
      * @throws ProxyException
@@ -95,14 +108,13 @@ class ProxyResponse extends Response
         $socket  = $this->createConnection($urlInfo);
 
         try {
-            // 构建原始请求
             $request = $this->buildRequest($urlInfo);
 
             // 请求拦截器
             if ($this->requestInterceptor) {
-                [$request,$body] = call_user_func($this->requestInterceptor, $request, $urlInfo);
-                if(!empty($body)){
-                    echo $body;
+                [$request, $earlyBody] = ($this->requestInterceptor)($request, $urlInfo);
+                if ($earlyBody !== '') {
+                    echo $earlyBody;
                     flush();
                     return;
                 }
@@ -116,116 +128,101 @@ class ProxyResponse extends Response
         }
     }
 
-    /**
-     * @throws ProxyException
-     */
+    /* ------------------------------------------------------------------ */
+    /*                        Building & sending                          */
+    /* ------------------------------------------------------------------ */
+
     private function parseAndValidateUrl(string $url): array
     {
-        $parsed = parse_url($url);
-        if ($parsed === false || !isset($parsed['scheme'], $parsed['host'])) {
+        $p = parse_url($url);
+        if ($p === false || !isset($p['scheme'], $p['host'])) {
             throw new ProxyException("Invalid URL: $url");
         }
-        $this->path = $parsed['path'] ?? '/';
+        $this->path = $p['path'] ?? '/';
 
         return [
-            'scheme' => strtolower($parsed['scheme']),
-            'host'   => $parsed['host'],
-            'port'   => $parsed['port'] ?? ($parsed['scheme'] === 'https' ? 443 : 80),
+            'scheme' => strtolower($p['scheme']),
+            'host'   => $p['host'],
+            'port'   => $p['port'] ?? ($p['scheme'] === 'https' ? 443 : 80),
             'path'   => $this->path,
-            'query'  => isset($parsed['query']) ? '?' . $parsed['query'] : '',
+            'query'  => isset($p['query']) ? '?' . $p['query'] : '',
         ];
     }
 
     /**
      * @throws ProxyException
      */
-    private function createConnection(array $urlInfo)
+    private function createConnection(array $u)
     {
-        $context = stream_context_create($this->socketConfig);
-        $connStr = ($urlInfo['scheme'] === 'https' ? 'ssl://' : 'tcp://') .
-            $urlInfo['host'] . ':' . $urlInfo['port'];
+        $ctx = stream_context_create($this->socketConfig);
+        $dsn = ($u['scheme'] === 'https' ? 'ssl://' : 'tcp://')
+            . $u['host'] . ':' . $u['port'];
 
-        $socket = stream_socket_client(
-            $connStr,
-            $errno,
-            $errstr,
-            $this->timeout,
-            STREAM_CLIENT_CONNECT,
-            $context
+        $sock = stream_socket_client(
+            $dsn, $errno, $errstr, $this->timeout, STREAM_CLIENT_CONNECT, $ctx
         );
-
-        if (!$socket) {
+        if (!$sock) {
             throw new ProxyException("Connection failed: $errstr ($errno)");
         }
-
-        return $socket;
+        return $sock;
     }
 
-    private function buildRequest(array $urlInfo): string
+    private function buildRequest(array $u): string
     {
-        $headers    = $this->getRequestHeaders($urlInfo['host']);
-        $body       = file_get_contents('php://input');
-        $requestUri = $urlInfo['path'] . $urlInfo['query'];
+        $headers = $this->getRequestHeaders($u['host']);
+        $body    = file_get_contents('php://input');
+        $uri     = $u['path'] . $u['query'];
 
         return sprintf(
             "%s %s HTTP/1.1\r\n%sConnection: close\r\n\r\n%s",
-            $_SERVER['REQUEST_METHOD'],
-            $requestUri,
-            $headers,
-            $body
+            $_SERVER['REQUEST_METHOD'], $uri, $headers, $body
         );
     }
 
     private function getRequestHeaders(string $host): string
     {
-        $hdrs = "Host: $host\r\n";
+        $out = "Host: $host\r\n";
         foreach ($_SERVER as $k => $v) {
             if (str_starts_with($k, 'HTTP_') && $k !== 'HTTP_HOST') {
-                $name = str_replace('_', '-', substr($k, 5));
-                $hdrs .= "$name: $v\r\n";
+                $out .= str_replace('_', '-', substr($k, 5)) . ": $v\r\n";
             }
         }
-        return $hdrs;
+        return $out;
     }
 
-    private function sendRequest($socket, string $request): void
+    private function sendRequest($socket, string $req): void
     {
-        fwrite($socket, $request);
+        fwrite($socket, $req);
     }
 
     private function receiveResponse($socket): void
     {
-        // 读取并透传响应头
-        $headerDone = false;
-        $responseHeaders = [];
+        /* ---------- 透传响应头 ---------- */
+        $rawHost   = $this->getDomain($this->uri);
+        $replHost  = $this->getDomain($this->domain);
+        $headers   = [];
 
-        while (!$headerDone && !feof($socket)) {
+        while (!feof($socket)) {
             $line = fgets($socket);
-            if ($line === "\r\n") {
-                $headerDone = true;
-            } else {
-                $trimmed = trim($line);
-                if ($trimmed !== '') {
-                    header($trimmed);
-                    $responseHeaders[] = $trimmed;
-                }
+            if ($line === "\r\n") break;
+
+            $trim = trim($line);
+            if ($trim !== '') {
+                $hdr = str_replace($rawHost, $replHost, $trim);
+                header($hdr);
+                $headers[] = $hdr;
             }
         }
 
-        // 读取响应体
+        /* ---------- 读取响应体 ---------- */
         $body = '';
         while (!feof($socket)) {
             $body .= fread($socket, self::READ_BYTES);
         }
+        $body = str_replace($rawHost, $replHost, $body);
 
-        // 响应注入
         if ($this->responseInjector) {
-            $body = call_user_func(
-                $this->responseInjector,
-                $body,
-                $responseHeaders,
-                $this->path
-            );
+            $body = ($this->responseInjector)($body, $headers, $this->path);
         }
 
         echo $body;
@@ -237,5 +234,30 @@ class ProxyResponse extends Response
         if (is_resource($socket)) {
             fclose($socket);
         }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*                         Utility helpers                            */
+    /* ------------------------------------------------------------------ */
+
+    /** 遇到 Upgrade: websocket 或 URL scheme=ws(s) 就视为 WebSocket 请求 */
+    private function isWebSocketRequest(): bool
+    {
+        // header 判断
+        $isUpgrade = isset($_SERVER['HTTP_UPGRADE'])
+            && strcasecmp($_SERVER['HTTP_UPGRADE'], 'websocket') === 0;
+        $hasConn   = isset($_SERVER['HTTP_CONNECTION'])
+            && stripos($_SERVER['HTTP_CONNECTION'], 'upgrade') !== false;
+
+        // URL scheme 判断
+        $scheme = strtolower(parse_url($this->uri, PHP_URL_SCHEME) ?: '');
+        $isWsScheme = in_array($scheme, ['ws', 'wss'], true);
+
+        return ($isUpgrade && $hasConn) || $isWsScheme;
+    }
+
+    private function getDomain(string $d): string
+    {
+        return str_replace(['https://', 'http://'], '', trim($d, '/'));
     }
 }
