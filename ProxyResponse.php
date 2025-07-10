@@ -2,77 +2,73 @@
 
 declare(strict_types=1);
 
-/*
- * Copyright (c) 2025. Lorem ipsum dolor sit amet, consectetur adipiscing elit.
- * Morbi non lorem porttitor neque feugiat blandit. Ut vitae ipsum eget quam lacinia accumsan.
- * Etiam sed turpis ac ipsum condimentum fringilla. Maecenas magna.
- * Proin dapibus sapien vel ante. Aliquam erat volutpat. Pellentesque sagittis ligula eget metus.
- * Vestibulum commodo. Ut rhoncus gravida arcu.
- */
-
 namespace nova\plugin\proxy;
 
-use nova\framework\log\Logger;
-use nova\framework\request\Response;
+use nova\framework\core\Logger;
+use nova\framework\http\Response;
 
 class ProxyResponse extends Response
 {
     private string $uri;
     private array $socketConfig;
-    /**
-     * @var callable $responseBodyHandler
-     */
-    private $responseBodyHandler = null;
-    private array $responseBodyUris = [];
-    /**
-     * @var callable $responseHandler
-     */
-    private $responseHandler = null;
+    private string $path = "";
 
-    public const int READ_BYTES = 4096;
-    /**
-     * @var callable $errorHandler
-     */
+    /** @var callable|null (string $rawRequest, array $urlInfo): array */
+    private $requestInterceptor = null;
+
+    /** @var callable|null (string $respBody, array $respHeaders, string $path): string */
+    private $responseInjector = null;
+
+    /** @var callable|null (\Exception $exception): void */
     private $errorHandler = null;
-
+    public const int READ_BYTES = 4096;
     private int $timeout = 30;
 
-    public function setTimeout($timeout)
+    public function __construct(string $uri)
+    {
+        parent::__construct();
+
+        $this->uri = $uri;
+        $this->socketConfig = [
+            'ssl' => [
+                'verify_peer'       => false,
+                'verify_peer_name'  => false,
+            ],
+        ];
+    }
+
+    public function setTimeout(int $timeout): self
     {
         $this->timeout = $timeout;
         return $this;
     }
 
-    public function setErrorHandler(callable $err)
+    public function setErrorHandler(callable $err): self
     {
         $this->errorHandler = $err;
         return $this;
     }
 
-    public function setResponseBodyHandler(callable $callback, array $uris = [])
+    /**
+     * @param callable (string $rawRequest, array $urlInfo): array $callback
+     * @return ProxyResponse
+     */
+    public function setRequestInterceptor(callable $callback): self
     {
-        $this->responseBodyHandler = $callback;
-        $this->responseBodyUris = $uris;
+        $this->requestInterceptor = $callback;
         return $this;
     }
 
-    public function setResponseHandler(callable $handler)
+    /**
+     * @param callable (string $respBody, array $respHeaders, string $path): string  $callback
+     * @return $this
+     */
+    public function setResponseInjector(callable $callback): self
     {
-        $this->responseHandler = $handler;
+        $this->responseInjector = $callback;
         return $this;
     }
 
-    public function __construct(string $uri)
-    {
-        $this->uri = $uri;
-        $this->socketConfig = [
-            'ssl' => [
-                'verify_peer' => false,
-                'verify_peer_name' => false
-            ]
-        ];
-        parent::__construct();
-    }
 
     /**
      * @throws ProxyException
@@ -81,8 +77,8 @@ class ProxyResponse extends Response
     {
         try {
             $this->forwardRequest($this->uri);
-        } catch (\Exception $exception) {
-            if ($this->errorHandler && is_callable($this->errorHandler)) {
+        } catch (\Throwable $exception) {
+            if ($this->errorHandler) {
                 call_user_func($this->errorHandler, $exception);
             } else {
                 throw $exception;
@@ -96,11 +92,23 @@ class ProxyResponse extends Response
     private function forwardRequest(string $targetUri): void
     {
         $urlInfo = $this->parseAndValidateUrl($targetUri);
-        $socket = $this->createConnection($urlInfo);
+        $socket  = $this->createConnection($urlInfo);
 
         try {
+            // 构建原始请求
             $request = $this->buildRequest($urlInfo);
-            Logger::info("request:" . $request);
+
+            // 请求拦截器
+            if ($this->requestInterceptor) {
+                [$request,$body] = call_user_func($this->requestInterceptor, $request, $urlInfo);
+                if(!empty($body)){
+                    echo $body;
+                    flush();
+                    return;
+                }
+            }
+
+            Logger::info("-> Proxying Request:\n" . $request);
             $this->sendRequest($socket, $request);
             $this->receiveResponse($socket);
         } finally {
@@ -108,26 +116,23 @@ class ProxyResponse extends Response
         }
     }
 
-    private string $path = "";
-
     /**
      * @throws ProxyException
      */
     private function parseAndValidateUrl(string $url): array
     {
-        $parsedUrl = parse_url($url);
-        if ($parsedUrl === false || !isset($parsedUrl['scheme']) || !isset($parsedUrl['host'])) {
-            throw new ProxyException("无效的URL格式：$url");
+        $parsed = parse_url($url);
+        if ($parsed === false || !isset($parsed['scheme'], $parsed['host'])) {
+            throw new ProxyException("Invalid URL: $url");
         }
-
-        $this->path = $parsedUrl['path'] ?? '/';
+        $this->path = $parsed['path'] ?? '/';
 
         return [
-            'scheme' => strtolower($parsedUrl['scheme']),
-            'host' => $parsedUrl['host'],
-            'port' => $parsedUrl['port'] ?? ($parsedUrl['scheme'] === 'https' ? 443 : 80),
-            'path' =>  $this->path,
-            'query' => isset($parsedUrl['query']) ? '?' . $parsedUrl['query'] : '',
+            'scheme' => strtolower($parsed['scheme']),
+            'host'   => $parsed['host'],
+            'port'   => $parsed['port'] ?? ($parsed['scheme'] === 'https' ? 443 : 80),
+            'path'   => $this->path,
+            'query'  => isset($parsed['query']) ? '?' . $parsed['query'] : '',
         ];
     }
 
@@ -137,11 +142,11 @@ class ProxyResponse extends Response
     private function createConnection(array $urlInfo)
     {
         $context = stream_context_create($this->socketConfig);
-        $connectionString = ($urlInfo['scheme'] === 'https' ? 'ssl://' : 'tcp://') .
+        $connStr = ($urlInfo['scheme'] === 'https' ? 'ssl://' : 'tcp://') .
             $urlInfo['host'] . ':' . $urlInfo['port'];
 
         $socket = stream_socket_client(
-            $connectionString,
+            $connStr,
             $errno,
             $errstr,
             $this->timeout,
@@ -150,7 +155,7 @@ class ProxyResponse extends Response
         );
 
         if (!$socket) {
-            throw new ProxyException("连接失败: $errstr ($errno)");
+            throw new ProxyException("Connection failed: $errstr ($errno)");
         }
 
         return $socket;
@@ -158,14 +163,14 @@ class ProxyResponse extends Response
 
     private function buildRequest(array $urlInfo): string
     {
-        $headers = $this->getRequestHeaders($urlInfo['host']);
-        $body = file_get_contents('php://input');
-        $targetPath = $urlInfo['path'] . $urlInfo['query'];
+        $headers    = $this->getRequestHeaders($urlInfo['host']);
+        $body       = file_get_contents('php://input');
+        $requestUri = $urlInfo['path'] . $urlInfo['query'];
 
         return sprintf(
             "%s %s HTTP/1.1\r\n%sConnection: close\r\n\r\n%s",
             $_SERVER['REQUEST_METHOD'],
-            $targetPath,
+            $requestUri,
             $headers,
             $body
         );
@@ -173,14 +178,14 @@ class ProxyResponse extends Response
 
     private function getRequestHeaders(string $host): string
     {
-        $headers = "Host: $host\r\n";
-        foreach ($_SERVER as $key => $value) {
-            if (str_starts_with($key, 'HTTP_') && $key !== 'HTTP_HOST') {
-                $headerKey = str_replace('_', '-', substr($key, 5));
-                $headers .= "$headerKey: $value\r\n";
+        $hdrs = "Host: $host\r\n";
+        foreach ($_SERVER as $k => $v) {
+            if (str_starts_with($k, 'HTTP_') && $k !== 'HTTP_HOST') {
+                $name = str_replace('_', '-', substr($k, 5));
+                $hdrs .= "$name: $v\r\n";
             }
         }
-        return $headers;
+        return $hdrs;
     }
 
     private function sendRequest($socket, string $request): void
@@ -190,60 +195,41 @@ class ProxyResponse extends Response
 
     private function receiveResponse($socket): void
     {
-        // 读取并处理响应头
-        $headerComplete = false;
+        // 读取并透传响应头
+        $headerDone = false;
         $responseHeaders = [];
 
-        while (!$headerComplete && !feof($socket)) {
+        while (!$headerDone && !feof($socket)) {
             $line = fgets($socket);
             if ($line === "\r\n") {
-                $headerComplete = true;
+                $headerDone = true;
             } else {
-                if (!empty(trim($line))) {
-                    $responseHeaders[] = trim($line);
-                    header(trim($line));
+                $trimmed = trim($line);
+                if ($trimmed !== '') {
+                    header($trimmed);
+                    $responseHeaders[] = $trimmed;
                 }
             }
         }
 
-        // 调用响应处理器
-        if ($this->responseHandler && is_callable($this->responseHandler)) {
-            call_user_func($this->responseHandler, $responseHeaders);
-        }
-
-        $body = "";
-
-        $isResponseBodyHandler =
-            $this->responseBodyHandler &&
-            is_callable($this->responseBodyHandler) &&
-            $this->responseBodyUris;
-        if ($isResponseBodyHandler) {
-            $isResponseBodyHandler = false;
-            foreach ($this->responseBodyUris as $uri) {
-                if (str_contains($this->path, $uri)) {
-                    $isResponseBodyHandler = true;
-                    break;
-                }
-            }
-        }
-
-        // 直接将响应体输出到浏览器
+        // 读取响应体
+        $body = '';
         while (!feof($socket)) {
-            $data = fread($socket, ProxyResponse::READ_BYTES);
-            if ($isResponseBodyHandler) {
-                $body .= $data;
-            } else {
-                echo $data;
-                flush();
-            }
+            $body .= fread($socket, self::READ_BYTES);
         }
 
-        Logger::info($body);
-
-        if ($isResponseBodyHandler) {
-            echo call_user_func($this->responseBodyHandler, $body, $this->path);
-            flush();
+        // 响应注入
+        if ($this->responseInjector) {
+            $body = call_user_func(
+                $this->responseInjector,
+                $body,
+                $responseHeaders,
+                $this->path
+            );
         }
+
+        echo $body;
+        flush();
     }
 
     private function closeConnection($socket): void
