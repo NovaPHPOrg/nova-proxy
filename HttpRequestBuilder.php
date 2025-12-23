@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace nova\plugin\proxy;
@@ -27,24 +28,23 @@ class HttpRequestBuilder
     private function buildHeaders(string $host): string
     {
         $out = "Host: $host\r\n";
-        
+
         foreach ($_SERVER as $k => $v) {
             if (!str_starts_with($k, 'HTTP_') || $k === 'HTTP_HOST') {
                 continue;
             }
-            
+
             $headerName = str_replace('_', '-', substr($k, 5));
-            
+
             // 强制只接受 gzip，PHP 没有内置 brotli 解码
             if ($headerName === 'ACCEPT-ENCODING') {
                 $out .= "Accept-Encoding: gzip, deflate\r\n";
                 continue;
             }
-            
+
             $out .= "$headerName: $v\r\n";
         }
-        
+
         return $out;
     }
 }
-

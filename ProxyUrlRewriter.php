@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace nova\plugin\proxy;
@@ -130,9 +131,8 @@ class ProxyUrlRewriter
         if ($port === null) {
             return '';
         }
-        
+
         $defaultPort = ($scheme === 'https') ? 443 : 80;
         return ($port !== $defaultPort) ? ":{$port}" : '';
     }
 }
-

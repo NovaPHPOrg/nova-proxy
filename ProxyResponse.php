@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace nova\plugin\proxy;
@@ -12,7 +13,7 @@ class ProxyResponse extends Response
     private string $fullPath;
     private string $proxyPrefix;
     private string $currentPath = '';
-    
+
     private array  $socketConfig;
     private int    $timeout = 30;
 
@@ -33,11 +34,11 @@ class ProxyResponse extends Response
     public function __construct(string $uri, string $fullPath, string $proxyPrefix = '')
     {
         parent::__construct();
-        
+
         $this->uri         = $uri;
         $this->fullPath    = $fullPath;
         $this->proxyPrefix = $proxyPrefix;
-        
+
         $this->socketConfig = [
             'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
         ];
@@ -131,7 +132,7 @@ class ProxyResponse extends Response
             }
 
             Logger::debug("-> Proxying Request:\n" . $request);
-            
+
             $this->sendRequest($socket, $request);
             $this->receiveAndProcessResponse($socket);
         } finally {
@@ -149,7 +150,7 @@ class ProxyResponse extends Response
         if ($p === false || !isset($p['scheme'], $p['host'])) {
             throw new ProxyException("Invalid URL: $url");
         }
-        
+
         $this->currentPath = $p['path'] ?? '/';
 
         return [
@@ -171,13 +172,18 @@ class ProxyResponse extends Response
             . $u['host'] . ':' . $u['port'];
 
         $sock = stream_socket_client(
-            $dsn, $errno, $errstr, $this->timeout, STREAM_CLIENT_CONNECT, $ctx
+            $dsn,
+            $errno,
+            $errstr,
+            $this->timeout,
+            STREAM_CLIENT_CONNECT,
+            $ctx
         );
-        
+
         if (!$sock) {
             throw new ProxyException("Connection failed: $errstr ($errno)");
         }
-        
+
         return $sock;
     }
 
@@ -194,9 +200,9 @@ class ProxyResponse extends Response
     private function receiveAndProcessResponse($socket): void
     {
         [$headers, $body] = $this->responseReader->read($socket);
-        
+
         $body = $this->processResponseBody($body, $headers);
-        
+
         $this->sendResponseToClient($headers, $body);
     }
 

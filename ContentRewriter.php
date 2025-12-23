@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace nova\plugin\proxy;
@@ -6,7 +7,7 @@ namespace nova\plugin\proxy;
 /**
  * 内容重写器
  * 职责：重写 HTML/CSS/JS 中的所有外部链接，添加 proxy prefix
- * 
+ *
  * 重写规则：
  * - 绝对路径（/path）-> prefix + /path
  * - 相对路径（./path, ../path）-> 保持不变（浏览器会自动相对于当前页面）
@@ -21,9 +22,9 @@ class ContentRewriter
     public function __construct(string $prefix, string $targetUri)
     {
         $this->prefix = rtrim($prefix, '/');
-        
+
         $parsed = parse_url($targetUri);
-        $this->targetOrigin = ($parsed['scheme'] ?? 'https') . '://' . 
+        $this->targetOrigin = ($parsed['scheme'] ?? 'https') . '://' .
                              ($parsed['host'] ?? '');
         if (isset($parsed['port'])) {
             $this->targetOrigin .= ':' . $parsed['port'];
@@ -49,12 +50,12 @@ class ContentRewriter
         if (str_contains($contentType, 'text/html')) {
             return $this->rewriteHtml($content);
         }
-        
-        if (str_contains($contentType, 'text/css') || 
+
+        if (str_contains($contentType, 'text/css') ||
             str_contains($contentType, 'application/css')) {
             return $this->rewriteCss($content);
         }
-        
+
         // JS/JSON 不重写，通过 hook 请求类处理
         return $content;
     }
@@ -73,21 +74,21 @@ class ContentRewriter
         // 重写 src 属性
         $html = preg_replace_callback(
             '#\s(src|href|action)=["\']([^"\']+)["\']#i',
-            fn($m) => ' ' . $m[1] . '="' . $this->rewriteUrl($m[2]) . '"',
+            fn ($m) => ' ' . $m[1] . '="' . $this->rewriteUrl($m[2]) . '"',
             $html
         );
 
         // 重写内联样式中的 url()
         $html = preg_replace_callback(
             '#style=["\']([^"\']*url\([^)]+\)[^"\']*)["\']#i',
-            fn($m) => 'style="' . $this->rewriteCss($m[1]) . '"',
+            fn ($m) => 'style="' . $this->rewriteCss($m[1]) . '"',
             $html
         );
 
         // 重写 <style> 标签内容
         $html = preg_replace_callback(
             '#<style[^>]*>(.*?)</style>#is',
-            fn($m) => '<style' . substr($m[0], 6, strpos($m[0], '>') - 6) . '>' . 
+            fn ($m) => '<style' . substr($m[0], 6, strpos($m[0], '>') - 6) . '>' .
                      $this->rewriteCss($m[1]) . '</style>',
             $html
         );
@@ -114,7 +115,7 @@ class ContentRewriter
     {
         return preg_replace_callback(
             '#url\(\s*["\']?([^"\')]+)["\']?\s*\)#i',
-            fn($m) => 'url("' . $this->rewriteUrl($m[1]) . '")',
+            fn ($m) => 'url("' . $this->rewriteUrl($m[1]) . '")',
             $css
         );
     }
@@ -134,8 +135,8 @@ class ContentRewriter
         $url = trim($url);
 
         // 空URL、锚点、data URI、javascript: 不重写
-        if ($url === '' || 
-            str_starts_with($url, '#') || 
+        if ($url === '' ||
+            str_starts_with($url, '#') ||
             str_starts_with($url, 'data:') ||
             str_starts_with($url, 'javascript:') ||
             str_starts_with($url, 'mailto:')) {
@@ -199,4 +200,3 @@ class ContentRewriter
         return '/' . implode('/', $result);
     }
 }
-

@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace nova\plugin\proxy;
@@ -19,7 +20,7 @@ class HttpResponseReader
     {
         $headers = $this->readHeaders($socket);
         $body    = $this->readBody($socket);
-        
+
         return [$headers, $body];
     }
 
@@ -41,10 +42,12 @@ class HttpResponseReader
             }
 
             $trim = trim($line);
-            if ($trim === '') continue;
+            if ($trim === '') {
+                continue;
+            }
 
             // 检测传输编码
-            if (stripos($trim, 'Transfer-Encoding:') === 0 && 
+            if (stripos($trim, 'Transfer-Encoding:') === 0 &&
                 stripos($trim, 'chunked') !== false) {
                 $chunked = true;
                 continue;
@@ -101,13 +104,17 @@ class HttpResponseReader
         $out = '';
         while ($data !== '') {
             $pos = strpos($data, "\r\n");
-            if ($pos === false) break;
-            
+            if ($pos === false) {
+                break;
+            }
+
             $lenHex = trim(substr($data, 0, $pos));
             $len    = hexdec($lenHex);
-            
-            if ($len === 0) break;
-            
+
+            if ($len === 0) {
+                break;
+            }
+
             $out  .= substr($data, $pos + 2, $len);
             $data  = substr($data, $pos + 2 + $len + 2);
         }
@@ -123,7 +130,7 @@ class HttpResponseReader
             $decoded = @gzdecode($data);
             return $decoded !== false ? $decoded : $data;
         }
-        
+
         if ($encoding === 'deflate') {
             // deflate 可能是 raw deflate 或 zlib wrapped
             $decoded = @gzinflate($data);
@@ -132,7 +139,7 @@ class HttpResponseReader
             }
             return $decoded !== false ? $decoded : $data;
         }
-        
+
         return $data;
     }
 
@@ -144,4 +151,3 @@ class HttpResponseReader
         return gzencode($data);
     }
 }
-
