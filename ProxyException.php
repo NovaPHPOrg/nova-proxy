@@ -12,6 +12,11 @@ declare(strict_types=1);
 
 namespace nova\plugin\proxy;
 
+/**
+ * 代理模块异常类型。
+ *
+ * 用于统一标记连接、协议解析、转发流程中的可预期错误。
+ */
 class ProxyException extends \Exception
 {
 }

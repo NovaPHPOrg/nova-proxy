@@ -1,4 +1,5 @@
 <?php
+
 declare(strict_types=1);
 
 namespace nova\plugin\proxy;
@@ -6,11 +7,26 @@ namespace nova\plugin\proxy;
 use nova\framework\core\Logger;
 use nova\framework\http\Response;
 
+/**
+ * 代理响应处理器。
+ *
+ * 负责将客户端请求转发到目标站点，读取并处理目标响应，
+ * 再将重写后的头部与内容回传给客户端。
+ */
 class ProxyResponse extends Response
 {
     private string $uri;
+    private string $fullPath;
+    private string $proxyPrefix;
+    private string $currentPath = '';
+
     private array  $socketConfig;
-    private string $path = '';
+    private int    $timeout = 30;
+
+    private HttpRequestBuilder $requestBuilder;
+    private HttpResponseReader $responseReader;
+    private ProxyUrlRewriter   $urlRewriter;
+    private ContentRewriter    $contentRewriter;
 
     /** @var callable|null (string $rawRequest, array $urlInfo): array */
     private $requestInterceptor = null;
@@ -21,23 +37,27 @@ class ProxyResponse extends Response
     /** @var callable|null (\Throwable $exception): void */
     private $errorHandler      = null;
 
-    public const int READ_BYTES = 4096;
-    private int  $timeout = 30;
-    private string $domain = '';
-
-    public function __construct(string $uri, string $domain)
+    public function __construct(string $uri, string $fullPath, string $proxyPrefix = '')
     {
         parent::__construct();
 
-        $this->uri   = $uri;
-        $this->domain = $domain;
+        $this->uri         = $uri;
+        $this->fullPath    = $fullPath;
+        $this->proxyPrefix = $proxyPrefix;
+
         $this->socketConfig = [
             'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
         ];
+
+        // 初始化协作类
+        $this->requestBuilder  = new HttpRequestBuilder();
+        $this->responseReader  = new HttpResponseReader();
+        $this->urlRewriter     = new ProxyUrlRewriter($uri, $fullPath, $proxyPrefix);
+        $this->contentRewriter = new ContentRewriter($proxyPrefix, $uri);
     }
 
     /* ------------------------------------------------------------------ */
-    /*               Public helpers (chain-style setters)                 */
+    /*               Public API (chain-style setters)                     */
     /* ------------------------------------------------------------------ */
 
     public function setTimeout(int $timeout): self
@@ -52,7 +72,7 @@ class ProxyResponse extends Response
         return $this;
     }
 
-    /** @param callable (string $rawRequest, array $urlInfo): array $cb */
+    /** @param callable (string $requestHeader, array $urlInfo, ?string $requestBody): array $cb — $requestBody 为 null 表示文件上传（body 未读取） */
     public function setRequestInterceptor(callable $cb): self
     {
         $this->requestInterceptor = $cb;
@@ -72,16 +92,13 @@ class ProxyResponse extends Response
 
     /**
      * @throws ProxyException
+     * @throws \Throwable
      */
     public function send(): void
     {
         try {
-            // *** WS GUARD: 拒绝 WebSocket 升级 & ws / wss 目标
             if ($this->isWebSocketRequest()) {
-                header('HTTP/1.1 501 Not Implemented');
-                header('Content-Type: text/plain; charset=utf-8');
-                echo 'WebSocket is not supported by this proxy.';
-                flush();
+                $this->rejectWebSocket();
                 return;
             }
 
@@ -108,11 +125,14 @@ class ProxyResponse extends Response
         $socket  = $this->createConnection($urlInfo);
 
         try {
-            $request = $this->buildRequest($urlInfo);
+            $requestHeader = $this->requestBuilder->buildHeader($urlInfo);
+            $isFileUpload  = $this->isFileUpload();
 
             // 请求拦截器
             if ($this->requestInterceptor) {
-                [$request, $earlyBody] = ($this->requestInterceptor)($request, $urlInfo);
+                // 文件上传时不读取 body，避免 OOM；非文件上传时读取 body 供拦截器判断
+                $requestBody = $isFileUpload ? null : file_get_contents('php://input');
+                [$requestHeader, $earlyBody] = ($this->requestInterceptor)($requestHeader, $urlInfo, $requestBody);
                 if ($earlyBody !== '') {
                     echo $earlyBody;
                     flush();
@@ -120,31 +140,47 @@ class ProxyResponse extends Response
                 }
             }
 
-            Logger::info("-> Proxying Request:\n" . $request);
-            $this->sendRequest($socket, $request);
-            $this->receiveResponse($socket);
+            Logger::debug("-> Proxying Request Header:\n" . $requestHeader);
+
+            fwrite($socket, $requestHeader);
+
+            if (!$isFileUpload && isset($requestBody)) {
+                // 非文件上传：body 已读入内存，直接写入
+                if ($requestBody !== '') {
+                    fwrite($socket, $requestBody);
+                }
+            } else {
+                // 文件上传或无拦截器：流式转发请求体
+                $this->requestBuilder->streamBody($socket);
+            }
+
+            $this->receiveAndProcessResponse($socket);
         } finally {
             $this->closeConnection($socket);
         }
     }
 
     /* ------------------------------------------------------------------ */
-    /*                        Building & sending                          */
+    /*                        Request building                            */
     /* ------------------------------------------------------------------ */
 
+    /**
+     * @throws ProxyException
+     */
     private function parseAndValidateUrl(string $url): array
     {
         $p = parse_url($url);
         if ($p === false || !isset($p['scheme'], $p['host'])) {
             throw new ProxyException("Invalid URL: $url");
         }
-        $this->path = $p['path'] ?? '/';
+
+        $this->currentPath = $p['path'] ?? '/';
 
         return [
             'scheme' => strtolower($p['scheme']),
             'host'   => $p['host'],
             'port'   => $p['port'] ?? ($p['scheme'] === 'https' ? 443 : 80),
-            'path'   => $this->path,
+            'path'   => $this->currentPath,
             'query'  => isset($p['query']) ? '?' . $p['query'] : '',
         ];
     }
@@ -159,150 +195,134 @@ class ProxyResponse extends Response
             . $u['host'] . ':' . $u['port'];
 
         $sock = stream_socket_client(
-            $dsn, $errno, $errstr, $this->timeout, STREAM_CLIENT_CONNECT, $ctx
+            $dsn,
+            $errno,
+            $errstr,
+            $this->timeout,
+            STREAM_CLIENT_CONNECT,
+            $ctx
         );
+
         if (!$sock) {
             throw new ProxyException("Connection failed: $errstr ($errno)");
         }
+
         return $sock;
-    }
-
-    private function buildRequest(array $u): string
-    {
-        $headers = $this->getRequestHeaders($u['host']);
-        $body    = file_get_contents('php://input');
-        $uri     = $u['path'] . $u['query'];
-
-        return sprintf(
-            "%s %s HTTP/1.1\r\n%sConnection: close\r\n\r\n%s",
-            $_SERVER['REQUEST_METHOD'], $uri, $headers, $body
-        );
-    }
-
-    private function getRequestHeaders(string $host): string
-    {
-        $out = "Host: $host\r\n";
-        foreach ($_SERVER as $k => $v) {
-            if (str_starts_with($k, 'HTTP_') && $k !== 'HTTP_HOST') {
-                $out .= str_replace('_', '-', substr($k, 5)) . ": $v\r\n";
-            }
-        }
-        return $out;
     }
 
     private function sendRequest($socket, string $req): void
     {
+        Logger::debug("-> Sending Request:\n" . $req);
         fwrite($socket, $req);
     }
 
-    private function receiveResponse($socket): void
+    /* ------------------------------------------------------------------ */
+    /*                        Response processing                         */
+    /* ------------------------------------------------------------------ */
+
+    private function receiveAndProcessResponse($socket): void
     {
-        $rawHost  = $this->getDomain($this->uri);
-        $replHost = $this->getDomain($this->domain);
+        // 先只读取响应头
+        $headersResult = $this->responseReader->readHeadersOnly($socket);
+        $headers = $headersResult;
 
-        $isChunked = false;
-        $isGzip    = false;
-        $hdrSent   = [];
-
-        /* ---------- 读取并处理响应头 ---------- */
-        while (!feof($socket)) {
-            $line = fgets($socket);
-            if ($line === "\r\n") {
-                break;                             // 头结束
-            }
-
-            $trim = trim($line);
-            if ($trim === '') continue;
-
-            // Transfer-Encoding: chunked  —— 不下发，标记后续解码
-            if (stripos($trim, 'Transfer-Encoding:') === 0 &&
-                stripos($trim, 'chunked')           !== false) {
-                $isChunked = true;
-                continue;
-            }
-
-            // Content-Encoding: gzip —— 标记，稍后可能换新的
-            if (stripos($trim, 'Content-Encoding:') === 0 &&
-                stripos($trim, 'gzip')             !== false) {
-                $isGzip = true;
-                // 先不发送，等主体处理完后再决定
-                continue;
-            }
-
-            // 其余头：做域名替换后立即透传
-            $hdr = str_replace($rawHost, $replHost, $trim);
-            header($hdr);
-            $hdrSent[] = $hdr;
+        // 判断是否需要内容重写（仅 text/html、text/css 需要）
+        if (!$headers['needsRewrite'] && !$this->responseInjector) {
+            // 流式模式：直接转发响应头和响应体，不缓冲
+            $this->sendStreamHeaders($headers);
+            $this->responseReader->streamToClient($socket, $headers);
+            return;
         }
 
-        /* ---------- 读取主体 ---------- */
-        $body = '';
-        while (!feof($socket)) {
-            $body .= fread($socket, self::READ_BYTES);
-        }
+        // 缓冲模式：需要重写内容
+        [$headers, $body] = $this->responseReader->readBuffered($socket, $headers);
+        $body = $this->processResponseBody($body, $headers);
+        $this->sendResponseToClient($headers, $body);
+    }
 
-        /* ---------- 分块解码 ---------- */
-        if ($isChunked) {
-            $body = $this->decodeChunked($body);
-        }
-
-        /* ---------- gzip 解压，用于文本替换 / 注入 ---------- */
-        if ($isGzip) {
-            $decoded = @gzdecode($body);
-            // 如果解压失败就保留原样
-            if ($decoded !== false) {
-                $body = $decoded;
+    /**
+     * 流式模式下发送响应头（重写 Location 和 Cookie，其他透传）
+     */
+    private function sendStreamHeaders(array $headers): void
+    {
+        foreach ($headers['lines'] as $line) {
+            if (stripos($line, 'Location:') === 0) {
+                $location = trim(substr($line, 9));
+                header('Location: ' . $this->urlRewriter->rewriteLocation($location));
+            } elseif (stripos($line, 'Set-Cookie:') === 0) {
+                header($this->urlRewriter->rewriteCookie($line), false);
+            } else {
+                header($line);
             }
         }
+    }
 
-        /* ---------- 域名替换 + 自定义注入 ---------- */
-        $body = str_replace($rawHost, $replHost, $body);
+    private function processResponseBody(string $body, array $headers): string
+    {
+        // 解码 chunked
+        if ($headers['chunked']) {
+            $body = $this->responseReader->decodeChunked($body);
+        }
 
+        // 解压 gzip/deflate
+        if ($headers['encoding'] !== '') {
+            $body = $this->responseReader->decode($body, $headers['encoding']);
+        }
+
+        // 重写内容中的链接
+        $contentType = $this->getContentType($headers['lines']);
+        $this->contentRewriter->setCurrentPath($this->currentPath);
+        $body = $this->contentRewriter->rewrite($body, $contentType);
+
+        // 自定义注入
         if ($this->responseInjector) {
-            $body = ($this->responseInjector)(
-                $body,
-                $hdrSent,
-                $this->path
-            );
+            $body = ($this->responseInjector)($body, $headers['lines'], $this->currentPath);
         }
 
-        /* ---------- 如有 gzip 重新压回去 ---------- */
-        if ($isGzip) {
-            $body = gzencode($body);
-            header('Content-Encoding: gzip', true);          // replace/add
+        return $body;
+    }
+
+    private function getContentType(array $headerLines): string
+    {
+        foreach ($headerLines as $line) {
+            if (stripos($line, 'Content-Type:') === 0) {
+                return trim(substr($line, 13));
+            }
+        }
+        return 'text/plain';
+    }
+
+    private function sendResponseToClient(array $headers, string $body): void
+    {
+        // 发送响应头（重写 Location 和 Cookie）
+        foreach ($headers['lines'] as $line) {
+            if (stripos($line, 'Location:') === 0) {
+                $location = trim(substr($line, 9));
+                $newLocation = $this->urlRewriter->rewriteLocation($location);
+                header('Location: ' . $newLocation);
+            } elseif (stripos($line, 'Set-Cookie:') === 0) {
+                $cookie = $this->urlRewriter->rewriteCookie($line);
+                header($cookie, false);
+            } else {
+                header($line);
+            }
+        }
+
+        // 重新压缩为 gzip（统一输出格式）
+        if ($headers['encoding'] !== '') {
+            $body = $this->responseReader->encodeGzip($body);
+            header('Content-Encoding: gzip', true);
         } else {
-            // 确保没把上游的 gzip 头遗漏
             header_remove('Content-Encoding');
         }
 
-        /* ---------- 重新发送正确的长度 ---------- */
+        // 发送正确的长度
         header('Content-Length: ' . strlen($body), true);
 
-        /* ---------- 输出 ---------- */
+        // 输出
         echo $body;
         flush();
     }
-
-
-    /**
-     * 把 “块长度\r\n数据\r\n” 形式的数据解包成纯正文
-     */
-    private function decodeChunked(string $data): string
-    {
-        $out = '';
-        while ($data !== '') {
-            // 找 CRLF 之前的长度字段
-            if (($pos = strpos($data, "\r\n")) === false) break;
-            $lenHex = trim(substr($data, 0, $pos));
-            $len    = hexdec($lenHex);
-            if ($len === 0) break;                       // “0\r\n\r\n” 结束
-            $out  .= substr($data, $pos + 2, $len);       // 取出完整块
-            // 跳过 “len\r\n……数据……\r\n”
-            $data  = substr($data, $pos + 2 + $len + 2);
-        }
-        return $out;
-    }
-
 
     private function closeConnection($socket): void
     {
@@ -315,24 +335,43 @@ class ProxyResponse extends Response
     /*                         Utility helpers                            */
     /* ------------------------------------------------------------------ */
 
-    /** 遇到 Upgrade: websocket 或 URL scheme=ws(s) 就视为 WebSocket 请求 */
     private function isWebSocketRequest(): bool
     {
-        // header 判断
         $isUpgrade = isset($_SERVER['HTTP_UPGRADE'])
             && strcasecmp($_SERVER['HTTP_UPGRADE'], 'websocket') === 0;
         $hasConn   = isset($_SERVER['HTTP_CONNECTION'])
             && stripos($_SERVER['HTTP_CONNECTION'], 'upgrade') !== false;
 
-        // URL scheme 判断
         $scheme = strtolower(parse_url($this->uri, PHP_URL_SCHEME) ?: '');
         $isWsScheme = in_array($scheme, ['ws', 'wss'], true);
 
         return ($isUpgrade && $hasConn) || $isWsScheme;
     }
 
-    private function getDomain(string $d): string
+    /**
+     * 检测当前请求是否为文件上传
+     * 判断依据：multipart/form-data 或 Content-Length 超过阈值（2MB）
+     */
+    private function isFileUpload(): bool
     {
-        return str_replace(['https://', 'http://'], '', trim($d, '/'));
+        $contentType = $_SERVER['CONTENT_TYPE'] ?? '';
+        if (stripos($contentType, 'multipart/form-data') !== false) {
+            return true;
+        }
+
+        $contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+        if ($contentLength > 2 * 1024 * 1024) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private function rejectWebSocket(): void
+    {
+        header('HTTP/1.1 501 Not Implemented');
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'WebSocket is not supported by this proxy.';
+        flush();
     }
 }
