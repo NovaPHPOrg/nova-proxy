@@ -53,7 +53,7 @@ class ProxyResponse extends Response
         $this->requestBuilder  = new HttpRequestBuilder();
         $this->responseReader  = new HttpResponseReader();
         $this->urlRewriter     = new ProxyUrlRewriter($uri, $fullPath, $proxyPrefix);
-        $this->contentRewriter = new ContentRewriter($proxyPrefix, $uri);
+        $this->contentRewriter = new ContentRewriter($proxyPrefix, $uri, $fullPath);
     }
 
     /* ------------------------------------------------------------------ */
@@ -125,7 +125,7 @@ class ProxyResponse extends Response
         $socket  = $this->createConnection($urlInfo);
 
         try {
-            $requestHeader = $this->requestBuilder->buildHeader($urlInfo,$this->proxyPrefix);
+            $requestHeader = $this->requestBuilder->buildHeader($urlInfo);
             $isFileUpload  = $this->isFileUpload();
 
             // 请求拦截器

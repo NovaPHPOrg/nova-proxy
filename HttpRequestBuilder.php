@@ -15,9 +15,9 @@ class HttpRequestBuilder
     /**
      * 构建请求头部分（不含请求体）
      */
-    public function buildHeader(array $urlInfo,string $proxyPrefix): string
+    public function buildHeader(array $urlInfo): string
     {
-        $headers = $this->buildHeaders(empty($proxyPrefix)?'':$urlInfo['host']);
+        $headers = $this->buildHeaders($urlInfo['host']);
         $uri     = $urlInfo['path'] . $urlInfo['query'];
 
         // 传递原始 Content-Length 和 Content-Type
@@ -62,19 +62,14 @@ class HttpRequestBuilder
 
     private function buildHeaders(string $host): string
     {
-        $out = "";
-
-        $useHost = !empty($host);
-        if ($useHost) {
-            $out .= "Host: {$host}\r\n";
-        }
+        $out = "Host: {$host}\r\n";
 
         foreach ($_SERVER as $k => $v) {
             if (!str_starts_with($k, 'HTTP_') ) {
                 continue;
             }
 
-            if ($useHost && $k === 'HTTP_HOST') {
+            if ($k === 'HTTP_HOST') {
                 continue; // 已经单独处理 Host 头，避免重复
             }
 
