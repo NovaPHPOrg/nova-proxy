@@ -125,7 +125,7 @@ class ProxyResponse extends Response
         $socket  = $this->createConnection($urlInfo);
 
         try {
-            $requestHeader = $this->requestBuilder->buildHeader($urlInfo);
+            $requestHeader = $this->requestBuilder->buildHeader($urlInfo,$this->proxyPrefix);
             $isFileUpload  = $this->isFileUpload();
 
             // 请求拦截器
@@ -208,12 +208,6 @@ class ProxyResponse extends Response
         }
 
         return $sock;
-    }
-
-    private function sendRequest($socket, string $req): void
-    {
-        Logger::debug("-> Sending Request:\n" . $req);
-        fwrite($socket, $req);
     }
 
     /* ------------------------------------------------------------------ */
