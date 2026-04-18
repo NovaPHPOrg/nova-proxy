@@ -11,6 +11,7 @@ namespace nova\plugin\proxy;
 class HttpResponseReader
 {
     private const int READ_BYTES = 8192;
+    private const int STREAM_BYTES = 65536; // 64KB for streaming large files
 
     /**
      * 读取完整的 HTTP 响应（缓冲模式，用于需要重写的内容）
@@ -48,41 +49,45 @@ class HttpResponseReader
      */
     public function streamToClient($socket, array $headers): void
     {
-        // 发送原始响应头（由调用方处理 Location/Cookie 重写后调用此方法）
-        // 对于流式传输，保留原始编码，不解压/重压
+        // 关闭 PHP 输出缓冲，减少延迟
+        while (ob_get_level() > 0) {
+            ob_end_flush();
+        }
+
+        stream_set_timeout($socket, 30);
 
         if ($headers['chunked']) {
-            // chunked 模式：直接透传 chunk
             header('Transfer-Encoding: chunked');
-            while (!feof($socket)) {
-                $chunk = fread($socket, self::READ_BYTES);
-                if ($chunk !== false && $chunk !== '') {
-                    echo $chunk;
-                    flush();
-                }
-            }
         } elseif ($headers['contentLength'] >= 0) {
-            // 已知长度：直接透传
             header('Content-Length: ' . $headers['contentLength']);
-            $remaining = $headers['contentLength'];
-            while ($remaining > 0 && !feof($socket)) {
-                $toRead = min($remaining, self::READ_BYTES);
-                $chunk = fread($socket, $toRead);
-                if ($chunk !== false && $chunk !== '') {
-                    echo $chunk;
-                    flush();
-                    $remaining -= strlen($chunk);
-                }
+        }
+
+        $remaining = $headers['contentLength']; // -1 表示未知长度
+        $bufferSize = 0;
+
+        while (!feof($socket)) {
+            if ($remaining === 0) {
+                break;
             }
-        } else {
-            // 未知长度：读到连接关闭
-            while (!feof($socket)) {
-                $chunk = fread($socket, self::READ_BYTES);
-                if ($chunk !== false && $chunk !== '') {
-                    echo $chunk;
-                    flush();
-                }
+            $toRead = ($remaining > 0) ? min($remaining, self::STREAM_BYTES) : self::STREAM_BYTES;
+            $chunk = fread($socket, $toRead);
+            if ($chunk === false || $chunk === '') {
+                break;
             }
+            echo $chunk;
+            $len = strlen($chunk);
+            if ($remaining > 0) {
+                $remaining -= $len;
+            }
+            $bufferSize += $len;
+            if ($bufferSize >= 262144) {
+                flush();
+                $bufferSize = 0;
+            }
+        }
+
+        if ($bufferSize > 0) {
+            flush();
         }
     }
 

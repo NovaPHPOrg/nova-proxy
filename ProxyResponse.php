@@ -207,6 +207,8 @@ class ProxyResponse extends Response
             throw new ProxyException("Connection failed: $errstr ($errno)");
         }
 
+        stream_set_timeout($sock, $this->timeout);
+
         return $sock;
     }
 
