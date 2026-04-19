@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace nova\plugin\proxy;
 
+use nova\framework\core\Logger;
+
 /**
  * 内容重写器
  *
@@ -165,6 +167,11 @@ class ContentRewriter
      */
     public function rewriteHtml(string $html): string
     {
+        // 检查并处理 <base href="...">：如果存在，则只更新 base 的 href（将其指向代理前缀下的目标），
+        // 并且在页面其余位置跳过对相对路径的重写，依赖浏览器通过 base 来解析相对 URL。
+        preg_match('#<base[^>]*href=["\']([^"\']+)["\'][^>]*>#i', $html, $m);
+        $skipRelative = count($m) > 0;
+
         // 1. 注入请求 hook 脚本（在 <head> 标签之后立即插入）
         $hookScript = $this->buildHookScript();
         $html = preg_replace('#<head[^>]*>#i', '$0' . $hookScript, $html, 1);
@@ -172,22 +179,35 @@ class ContentRewriter
         // 2. 重写 src / href / action 属性
         $html = preg_replace_callback(
             '#\s(src|href|action)=["\']([^"\']+)["\']#i',
-            fn ($m) => ' ' . $m[1] . '="' . $this->rewriteUrl($m[2]) . '"',
+            function ($m) use ($skipRelative) {
+                $attr = $m[1];
+                $val = $m[2];
+                // 如果开启了跳过相对 URL 且该 URL 为相对路径，则不修改
+                if ($skipRelative && $this->isRelativeUrl($val)) {
+                    return ' ' . $attr . '="' . $val . '"';
+                }
+                Logger::debug("Rewriting HTML attribute(skipRelative=".($skipRelative ? 'true' : 'false').", not RelativeUrl($val)): $attr=\"$val\"");;
+                return ' ' . $attr . '="' . $this->rewriteUrl($val) . '"';
+            },
             $html
         );
 
         // 3. 重写内联样式中的 url()
         $html = preg_replace_callback(
             '#style=["\']([^"\']*url\([^)]+\)[^"\']*)["\']#i',
-            fn ($m) => 'style="' . $this->rewriteCss($m[1]) . '"',
+            function ($m) use ($skipRelative) {
+                return 'style="' . $this->rewriteCss($m[1], $skipRelative) . '"';
+            },
             $html
         );
 
         // 4. 重写 <style> 标签内的 CSS 内容
         $html = preg_replace_callback(
             '#<style[^>]*>(.*?)</style>#is',
-            fn ($m) => '<style' . substr($m[0], 6, strpos($m[0], '>') - 6) . '>' .
-                     $this->rewriteCss($m[1]) . '</style>',
+            function ($m) use ($skipRelative) {
+                return '<style' . substr($m[0], 6, strpos($m[0], '>') - 6) . '>' .
+                       $this->rewriteCss($m[1], $skipRelative) . '</style>';
+            },
             $html
         );
 
@@ -219,13 +239,20 @@ class ContentRewriter
      * - url("/path/to/file")
      *
      * @param  string $css 原始 CSS 内容（可以是完整样式表或内联样式片段）
+     * @param  bool   $skipRelative 如果为 true，则跳过对相对路径的重写（配合 <base> 使用）
      * @return string 重写后的 CSS
      */
-    public function rewriteCss(string $css): string
+    public function rewriteCss(string $css, bool $skipRelative = false): string
     {
         return preg_replace_callback(
             '#url\(\s*["\']?([^"\')]+)["\']?\s*\)#i',
-            fn ($m) => 'url("' . $this->rewriteUrl($m[1]) . '")',
+            function ($m) use ($skipRelative) {
+                $url = $m[1];
+                if ($skipRelative && $this->isRelativeUrl($url)) {
+                    return 'url("' . $url . '")';
+                }
+                return 'url("' . $this->rewriteUrl($url) . '")';
+            },
             $css
         );
     }
@@ -335,6 +362,33 @@ class ContentRewriter
         }
 
         return '/' . implode('/', $result);
+    }
+
+    /**
+     * 判断一个 URL 是否为相对 URL（不以 /、// 或协议开头）
+     *
+     * 相对 URL 示例："images/a.png"、"./a.png"、"../a.png"
+     * 非相对（绝对）示例："/a.png"、"//example.com/a.png"、"https://..."
+     *
+     * @param string $url
+     * @return bool
+     */
+    private function isRelativeUrl(string $url): bool
+    {
+        $url = trim($url);
+        if ($url === '') {
+            return false;
+        }
+        // 特殊协议和锚点等视为非相对（这些通常不应被 rewrite）
+        if (str_starts_with($url, '#') ||
+            str_starts_with($url, 'data:') ||
+            str_starts_with($url, 'javascript:') ||
+            str_starts_with($url, 'mailto:')) {
+            return false;
+        }
+
+        // 如果以 / 或 // 开头，或以 scheme: 开头，则视为非相对
+        return !preg_match('#^(?:[a-zA-Z][a-zA-Z0-9+.-]*:|//|/)#', $url);
     }
 
     /**

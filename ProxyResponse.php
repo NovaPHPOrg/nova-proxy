@@ -125,14 +125,33 @@ class ProxyResponse extends Response
         $socket  = $this->createConnection($urlInfo);
 
         try {
-            $requestHeader = $this->requestBuilder->buildHeader($urlInfo);
             $isFileUpload  = $this->isFileUpload();
+
+            // 对于文件上传尝试读取原始 php://input；如果为空且 PHP 已解析了 multipart（$_FILES 存在），
+            // 则从 globals 重建 multipart 流并计算长度，以便构造正确的请求头
+            $multipart = null;
+            $rawInput = null;
+            if ($isFileUpload) {
+                $rawInput = @file_get_contents('php://input');
+                if ($rawInput === false || $rawInput === '') {
+                    $multipart = $this->requestBuilder->buildMultipartBodyFromGlobals();
+                }
+            }
+
+            if ($multipart !== null) {
+                // 使用重建后的 Content-Type/Length
+                $extra = ['Content-Length' => $multipart['length'], 'Content-Type' => $multipart['content_type']];
+                $requestHeader = $this->requestBuilder->buildHeader($urlInfo, $extra);
+                $requestBodyForInterceptor = null;
+            } else {
+                $requestHeader = $this->requestBuilder->buildHeader($urlInfo);
+                // 请求拦截器需要原始 body（文件上传传 null）
+                $requestBodyForInterceptor = $isFileUpload ? null : ($rawInput ?? @file_get_contents('php://input'));
+            }
 
             // 请求拦截器
             if ($this->requestInterceptor) {
-                // 文件上传时不读取 body，避免 OOM；非文件上传时读取 body 供拦截器判断
-                $requestBody = $isFileUpload ? null : file_get_contents('php://input');
-                [$requestHeader, $earlyBody] = ($this->requestInterceptor)($requestHeader, $urlInfo, $requestBody);
+                [$requestHeader, $earlyBody] = ($this->requestInterceptor)($requestHeader, $urlInfo, $requestBodyForInterceptor);
                 if ($earlyBody !== '') {
                     echo $earlyBody;
                     flush();
@@ -144,12 +163,27 @@ class ProxyResponse extends Response
 
             fwrite($socket, $requestHeader);
 
-            if (!$isFileUpload && isset($requestBody)) {
+            if ($multipart !== null) {
+                Logger::debug("-> Proxying Request Body (reconstructed multipart) length=" . $multipart['length']);
+                $stream = $multipart['stream'];
+                try {
+                    while (!feof($stream)) {
+                        $chunk = fread($stream, 8192);
+                        if ($chunk !== false && $chunk !== '') {
+                            fwrite($socket, $chunk);
+                        }
+                    }
+                } finally {
+                    fclose($stream);
+                }
+            } elseif (!$isFileUpload && isset($requestBodyForInterceptor)) {
+                Logger::debug("-> Proxying Request Body (non-file upload, read into memory):\n" . $requestBodyForInterceptor);
                 // 非文件上传：body 已读入内存，直接写入
-                if ($requestBody !== '') {
-                    fwrite($socket, $requestBody);
+                if ($requestBodyForInterceptor !== '') {
+                    fwrite($socket, $requestBodyForInterceptor);
                 }
             } else {
+                Logger::debug("-> Proxying Request Body (file upload or no interceptor, streaming):\n");
                 // 文件上传或无拦截器：流式转发请求体
                 $this->requestBuilder->streamBody($socket);
             }
