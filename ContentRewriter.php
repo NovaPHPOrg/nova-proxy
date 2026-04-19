@@ -31,6 +31,8 @@ class ContentRewriter
 
     /** @var string 当前页面所在目录路径，用于解析相对路径 */
     private string $currentDir = '/';
+    /** @var string 原始目标 URL 的 path 部分（用于判断请求是否带有尾部斜杠等） */
+    private string $targetPath = '/';
 
     /**
      * 构造函数
@@ -44,6 +46,8 @@ class ContentRewriter
         $this->prefix = rtrim($prefix, '/');
         $this->proxyOrigin = $this->extractOrigin($proxyUri);
         $this->targetOrigins = $this->generateTargetOrigins($targetUri);
+        // 保存目标 URL 的 path 部分，可能包含尾部斜杠，用于在 setCurrentPath 中做更鲁棒的判断
+        $this->targetPath = parse_url($targetUri, PHP_URL_PATH) ?: '/';
     }
 
     /**
@@ -78,8 +82,44 @@ class ContentRewriter
      */
     public function setCurrentPath(string $path): void
     {
-        // 提取目录部分：/subdir/page.php -> /subdir/
-        $this->currentDir = rtrim(dirname($path), '/') . '/';
+        // 规范化输入
+        if ($path === '') {
+            $this->currentDir = '/';
+            return;
+        }
+
+        // 确保以 / 开头
+        if (!str_starts_with($path, '/')) {
+            $path = '/' . $path;
+        }
+
+        // 如果传入路径以 / 结尾，则视为目录，直接使用
+        if (str_ends_with($path, '/')) {
+            $this->currentDir = preg_replace('#/+#', '/', $path);
+            return;
+        }
+
+        // 传入路径不以 / 结尾，可能是文件也可能原始请求其实以 / 结尾但在上游被去掉了。
+        // 如果 basename 看起来像文件（包含点），默认按文件处理（dirname）;
+        // 但为了解决诸如 index.cgi/ 被上游丢失尾部斜杠导致相对路径解析错误的情况，
+        // 我们检测原始目标 URL 的 path（$this->targetPath）是否以该 basename 后跟 '/' 的形式存在，
+        // 如果是，则说明实际请求是以目录形式访问，应该保留该 basename 作为目录名。
+
+        $base = basename($path);
+        if (str_contains($base, '.')) {
+            // 检查原始目标 path 是否包含 basename 后跟斜杠（例如原始为 /.../index.cgi/）
+            if (str_ends_with($this->targetPath, $base . '/') || str_contains($this->targetPath, '/' . $base . '/')) {
+                // 将其视为目录
+                $this->currentDir = rtrim($path, '/') . '/';
+                return;
+            }
+            // 否则按文件处理，使用 dirname
+            $this->currentDir = rtrim(dirname($path), '/') . '/';
+            return;
+        }
+
+        // 不包含点，视为目录名
+        $this->currentDir = rtrim($path, '/') . '/';
     }
 
     /**
