@@ -186,7 +186,6 @@ class ContentRewriter
                 if ($skipRelative && $this->isRelativeUrl($val)) {
                     return ' ' . $attr . '="' . $val . '"';
                 }
-                Logger::debug("Rewriting HTML attribute(skipRelative=".($skipRelative ? 'true' : 'false').", not RelativeUrl($val)): $attr=\"$val\"");;
                 return ' ' . $attr . '="' . $this->rewriteUrl($val) . '"';
             },
             $html
