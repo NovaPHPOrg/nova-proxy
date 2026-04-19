@@ -17,25 +17,15 @@ class HttpRequestBuilder
      */
     public function buildHeader(array $urlInfo): string
     {
-        $headers = $this->buildHeaders($urlInfo['host']);
+        $headers = $this->buildHeaders($urlInfo);
         $uri     = $urlInfo['path'] . $urlInfo['query'];
-
-        // 传递原始 Content-Length 和 Content-Type
-        $extra = '';
-        if (!empty($_SERVER['CONTENT_TYPE'])) {
-            $extra .= "Content-Type: {$_SERVER['CONTENT_TYPE']}\r\n";
-        }
-        if (!empty($_SERVER['CONTENT_LENGTH'])) {
-            $extra .= "Content-Length: {$_SERVER['CONTENT_LENGTH']}\r\n";
-        }
 
 
         return sprintf(
-            "%s %s HTTP/1.1\r\n%s%sConnection: close\r\n\r\n",
+            "%s %s HTTP/1.1\r\n%sConnection: close\r\n\r\n",
             $_SERVER['REQUEST_METHOD'],
             $uri,
             $headers,
-            $extra
         );
     }
 
@@ -60,8 +50,12 @@ class HttpRequestBuilder
         }
     }
 
-    private function buildHeaders(string $host): string
+    private function buildHeaders(array $urlInfo): string
     {
+
+        $host = $urlInfo['host'].(isset($urlInfo['port']) ? ':'.$urlInfo['port'] : '');
+
+
         $out = "Host: {$host}\r\n";
 
         foreach ($_SERVER as $k => $v) {
