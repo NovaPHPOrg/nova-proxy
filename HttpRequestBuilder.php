@@ -83,31 +83,121 @@ class HttpRequestBuilder
             $out .= "{$name}: {$value}\r\n";
         }
 
+        $seen = ['HOST' => true, 'CONNECTION' => true];
+        $hasUa = false;
+        $hasAcceptLang = false;
+
         foreach ($_SERVER as $k => $v) {
             if (!str_starts_with($k, 'HTTP_')) {
                 continue;
             }
 
-            if ($k === 'HTTP_HOST') {
+            $headerName = str_replace('_', '-', substr($k, 5));
+            $upper = strtoupper($headerName);
+
+            if (isset($seen[$upper]) || $this->shouldSkipRequestHeader($upper)) {
                 continue;
             }
+            $seen[$upper] = true;
 
-            $headerName = str_replace('_', '-', substr($k, 5));
-
-            if ($headerName === 'ACCEPT-ENCODING') {
+            if ($upper === 'ACCEPT-ENCODING') {
                 $out .= "Accept-Encoding: gzip, deflate\r\n";
                 continue;
             }
 
-            if ($headerName === 'REFERER') {
+            if ($upper === 'COOKIE') {
+                $v = $this->filterProxyCookies((string)$v);
+                if ($v === '') {
+                    continue;
+                }
+            } elseif ($upper === 'REFERER') {
                 $v = $this->rewriteReferer((string)$v, $urlInfo);
-            } elseif ($headerName === 'ORIGIN') {
+            } elseif ($upper === 'ORIGIN') {
                 $v = $this->rewriteOrigin((string)$v, $urlInfo);
             }
 
-            $out .= "$headerName: $v\r\n";
+            if ($upper === 'USER-AGENT') {
+                $hasUa = true;
+            }
+            if ($upper === 'ACCEPT-LANGUAGE') {
+                $hasAcceptLang = true;
+            }
+
+            $out .= $this->formatHeaderName($headerName) . ": {$v}\r\n";
         }
+
+        if (!$hasUa) {
+            $out .= "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n";
+        }
+        if (!$hasAcceptLang) {
+            $out .= "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8\r\n";
+        }
+
         return $out;
+    }
+
+    private function shouldSkipRequestHeader(string $upperName): bool
+    {
+        static $skip = [
+            'HOST' => true,
+            'CONNECTION' => true,
+            'KEEP-ALIVE' => true,
+            'PROXY-CONNECTION' => true,
+            'TRANSFER-ENCODING' => true,
+            'TE' => true,
+            'TRAILER' => true,
+            'UPGRADE' => true,
+            'X-FORWARDED-FOR' => true,
+            'X-FORWARDED-HOST' => true,
+            'X-FORWARDED-PROTO' => true,
+            'X-FORWARDED-PORT' => true,
+            'X-REAL-IP' => true,
+            'FORWARDED' => true,
+            'VIA' => true,
+            'CF-CONNECTING-IP' => true,
+            'CF-RAY' => true,
+            'CF-IPCOUNTRY' => true,
+            'CF-VISITOR' => true,
+            'CDN-LOOP' => true,
+            'TRUE-CLIENT-IP' => true,
+        ];
+
+        return isset($skip[$upperName]);
+    }
+
+    /** 去掉代理自身 Session / debug Cookie，避免污染目标站风控。 */
+    private function filterProxyCookies(string $cookie): string
+    {
+        $parts = array_map('trim', explode(';', $cookie));
+        $keep = [];
+        foreach ($parts as $part) {
+            if ($part === '' || !str_contains($part, '=')) {
+                continue;
+            }
+            $name = trim(strtok($part, '='));
+            if ($name === '') {
+                continue;
+            }
+            if (str_ends_with($name, '_NovaSession') || str_ends_with($name, 'NovaSession')) {
+                continue;
+            }
+            if ($name === 'proxy_debug') {
+                continue;
+            }
+            $keep[] = $part;
+        }
+
+        return implode('; ', $keep);
+    }
+
+    private function formatHeaderName(string $name): string
+    {
+        $parts = explode('-', strtolower($name));
+        foreach ($parts as &$p) {
+            $p = ucfirst($p);
+        }
+
+        return implode('-', $parts);
     }
 
     private function rewriteReferer(string $referer, array $urlInfo): string

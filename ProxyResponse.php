@@ -291,7 +291,10 @@ class ProxyResponse extends Response
                 $location = trim(substr($line, 9));
                 header('Location: ' . $this->urlRewriter->rewriteLocation($location));
             } elseif (stripos($line, 'Set-Cookie:') === 0) {
-                header($this->urlRewriter->rewriteCookie($line), false);
+                $cookie = $this->urlRewriter->rewriteCookie($line);
+                if ($cookie !== '') {
+                    header($cookie, false);
+                }
             } else {
                 header($line);
             }
@@ -314,13 +317,14 @@ class ProxyResponse extends Response
         }
 
         $contentType = $this->getContentType($headers['lines']);
-        $isHtml = str_contains(strtolower($contentType), 'text/html');
-        if (self::isTextual($contentType)) {
+        $ctLower = strtolower($contentType);
+        $isHtml = str_contains($ctLower, 'text/html');
+        // 字符集归一化只对 HTML/CSS：JS 常含编码对照表等非 UTF-8 字节，强制转码/改 charset 会整文件乱码
+        if ($isHtml || str_contains($ctLower, 'text/css') || str_contains($ctLower, 'application/css')) {
             $charset = CharsetNormalizer::detect($contentType, $body);
             if ($charset !== 'UTF-8') {
                 $body = CharsetNormalizer::toUtf8($body, $charset);
             }
-            // 无论上游 Content-Type 是否声称 GBK，重写后的正文统一按 UTF-8 输出
             CharsetNormalizer::applyUtf8Headers($headers['lines']);
             if ($isHtml) {
                 $body = CharsetNormalizer::applyUtf8Meta($body);
@@ -386,7 +390,10 @@ class ProxyResponse extends Response
                 $location = trim(substr($line, 9));
                 header('Location: ' . $this->urlRewriter->rewriteLocation($location));
             } elseif (stripos($line, 'Set-Cookie:') === 0) {
-                header($this->urlRewriter->rewriteCookie($line), false);
+                $cookie = $this->urlRewriter->rewriteCookie($line);
+                if ($cookie !== '') {
+                    header($cookie, false);
+                }
             } else {
                 header($line);
             }
@@ -471,13 +478,27 @@ class ProxyResponse extends Response
         return $scheme . '://' . $host . $portStr;
     }
 
-    /** 去掉上游站点 CORS 限制，避免 CDN 资源经代理后仍被浏览器拦截。 */
+    /** 去掉上游站点 CORS / CSP，否则注入的 hook、调试脚本会被浏览器拦掉。 */
     private function shouldSkipResponseHeader(string $line): bool
     {
-        return stripos($line, 'Access-Control-Allow-Origin:') === 0
-            || stripos($line, 'Access-Control-Allow-Credentials:') === 0
-            || stripos($line, 'Access-Control-Allow-Methods:') === 0
-            || stripos($line, 'Access-Control-Allow-Headers:') === 0
-            || stripos($line, 'Access-Control-Expose-Headers:') === 0;
+        static $skip = [
+            'Access-Control-Allow-Origin:',
+            'Access-Control-Allow-Credentials:',
+            'Access-Control-Allow-Methods:',
+            'Access-Control-Allow-Headers:',
+            'Access-Control-Expose-Headers:',
+            'Content-Security-Policy:',
+            'Content-Security-Policy-Report-Only:',
+            'X-Content-Security-Policy:',
+            'X-WebKit-CSP:',
+        ];
+
+        foreach ($skip as $prefix) {
+            if (stripos($line, $prefix) === 0) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

@@ -138,7 +138,8 @@ class HttpResponseReader
                     $needsRewrite = true;
                 } elseif (str_contains($ct, 'text/css') || str_contains($ct, 'application/css')) {
                     $needsRewrite = true;
-                } elseif (str_contains($ct, 'javascript') || str_contains($ct, 'json')) {
+                } elseif (str_contains($ct, 'json') && !str_contains($ct, 'jsonp')) {
+                    // JSON 可安全做 origin 替换；独立 JS 一律流式透传，避免正则/转码毁掉压缩包与编码表
                     $needsRewrite = true;
                 }
             }

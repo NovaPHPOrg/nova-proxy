@@ -57,22 +57,27 @@ class ProxyUrlRewriter
     }
 
     /**
-     * 重写 Set-Cookie 响应头
+     * 重写 Set-Cookie：去掉 Domain，让 Cookie 绑在代理域名上。
+     * 知乎等站常用 domain=.zhihu.com，若不处理浏览器不会存到 proxy host，二次请求仍无风控 Cookie → 403。
+     * 代理自身 Cookie（proxy_debug / NovaSession）禁止被上游覆盖。
+     *
+     * @return string 空字符串表示丢弃该 Set-Cookie
      */
     public function rewriteCookie(string $header): string
     {
-        $targetHost = $this->targetUrl['host'];
-        $proxyHost  = $this->proxyUrl['host'];
-
-        if ($targetHost === '' || $proxyHost === '') {
-            return $header;
+        if (preg_match('/^Set-Cookie:\s*([^=\s;]+)/i', $header, $m)) {
+            $name = $m[1];
+            if ($name === 'proxy_debug'
+                || str_ends_with($name, '_NovaSession')
+                || str_ends_with($name, 'NovaSession')
+            ) {
+                return '';
+            }
         }
 
-        return preg_replace(
-            '#(domain\s*=\s*)' . preg_quote($targetHost, '#') . '(;|$|\s)#i',
-            '$1' . $proxyHost . '$2',
-            $header
-        );
+        $header = preg_replace('/;\s*domain=[^;]*/i', '', $header) ?? $header;
+
+        return $header;
     }
 
     /**

@@ -2,6 +2,7 @@
     var PROXY_PREFIX = '{{PREFIX}}';
     var TARGET_ORIGINS = {{TARGET_ORIGINS}};
     var CURRENT_ORIGIN = window.location.origin;
+    var PREFIX_ROOT = PROXY_PREFIX.replace(/\/$/, '');
 
     function rewriteUrl(url) {
         if (!url || typeof url !== 'string') return url;
@@ -61,7 +62,25 @@
             return PROXY_PREFIX + url;
         }
 
-        return url;
+        // ./svg/x.svg  ../x  file.js
+        return PROXY_PREFIX + resolveRelative(url);
+    }
+
+    function resolveRelative(rel) {
+        var base = PREFIX_ROOT + '/';
+        try {
+            var u = new URL(rel, CURRENT_ORIGIN + base);
+            var path = u.pathname || '/';
+            if (path.indexOf(PREFIX_ROOT + '/') === 0) {
+                path = path.substring(PREFIX_ROOT.length) || '/';
+            }
+            return path + (u.search || '') + (u.hash || '');
+        } catch (e) {
+            if (rel.indexOf('./') === 0) {
+                rel = rel.substring(2);
+            }
+            return '/' + rel.replace(/^\/+/, '');
+        }
     }
 
     function isAlreadyProxied(url) {
@@ -88,8 +107,6 @@
     }
 
     // SPA apps read location.pathname; strip proxy prefix so routes stay site-rooted.
-    var PREFIX_ROOT = PROXY_PREFIX.replace(/\/$/, '');
-
     function stripProxyPrefix(path) {
         if (!path || typeof path !== 'string') {
             return path;
@@ -111,6 +128,29 @@
         } catch (e) {}
         return obj;
     }
+
+    // 知乎 zse-ck 等会写 document.cookie="...; domain=.zhihu.com"。
+    // 页面实际 origin 是代理域名，浏览器会静默丢弃 → 永远 403。
+    // 剥掉 Domain，让 Cookie 绑在当前 host（与服务端 Set-Cookie 重写一致）。
+    try {
+        var cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie')
+            || Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie');
+        if (cookieDesc && cookieDesc.get && cookieDesc.set) {
+            Object.defineProperty(Document.prototype, 'cookie', {
+                configurable: true,
+                enumerable: true,
+                get: function () {
+                    return cookieDesc.get.call(this);
+                },
+                set: function (val) {
+                    cookieDesc.set.call(
+                        this,
+                        String(val).replace(/;\s*domain\s*=\s*[^;]*/gi, '')
+                    );
+                }
+            });
+        }
+    } catch (e) {}
 
     try {
         var pathDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
@@ -218,9 +258,21 @@
     };
 
     var URL_ATTRS = { src: 1, href: 1, action: 1, 'data-src': 1, 'data-href': 1 };
+
+    /** 鸭鸭Go 注入控件：禁止改写到 PROXY_PREFIX（否则「返回」变成目标站首页）。 */
+    function isDuckgoNav(el) {
+        return !!(el && el.getAttribute && (
+            el.id === 'duckgo-back' || el.hasAttribute('data-duckgo-nav')
+        ));
+    }
+
     var origSetAttribute = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function(name, value) {
-        if (typeof value === 'string' && URL_ATTRS[String(name).toLowerCase()]) {
+        if (
+            typeof value === 'string'
+            && URL_ATTRS[String(name).toLowerCase()]
+            && !isDuckgoNav(this)
+        ) {
             value = rewriteUrl(value);
         }
         return origSetAttribute.call(this, name, value);
@@ -253,6 +305,106 @@
     if (window.HTMLFormElement) {
         hookUrlProperty(HTMLFormElement.prototype, 'action');
     }
+    if (window.HTMLSourceElement) {
+        hookUrlProperty(HTMLSourceElement.prototype, 'src');
+    }
+
+    function fixUrlAttrs(el) {
+        if (!el || el.nodeType !== 1 || !el.getAttribute || isDuckgoNav(el)) {
+            return;
+        }
+        ['src', 'href', 'action', 'data-src', 'data-href', 'poster'].forEach(function (attr) {
+            if (!el.hasAttribute(attr)) {
+                return;
+            }
+            var cur = el.getAttribute(attr);
+            var next = rewriteUrl(cur);
+            if (next && next !== cur) {
+                origSetAttribute.call(el, attr, next);
+            }
+        });
+        if (el.hasAttribute('srcset')) {
+            var srcset = el.getAttribute('srcset');
+            var parts = String(srcset).split(',');
+            var changed = false;
+            for (var i = 0; i < parts.length; i++) {
+                var seg = parts[i].trim();
+                if (!seg) continue;
+                var bits = seg.split(/\s+/);
+                var u = rewriteUrl(bits[0]);
+                if (u !== bits[0]) {
+                    bits[0] = u;
+                    changed = true;
+                }
+                parts[i] = bits.join(' ');
+            }
+            if (changed) {
+                origSetAttribute.call(el, 'srcset', parts.join(', '));
+            }
+        }
+    }
+
+    function fixTree(root) {
+        if (!root) return;
+        if (root.nodeType === 1) {
+            fixUrlAttrs(root);
+        }
+        if (!root.querySelectorAll) return;
+        var list = root.querySelectorAll('[src],[href],[action],[data-src],[data-href],[poster],[srcset]');
+        for (var i = 0; i < list.length; i++) {
+            fixUrlAttrs(list[i]);
+        }
+    }
+
+    function rewriteHtmlString(html) {
+        if (!html || typeof html !== 'string') {
+            return html;
+        }
+        return html.replace(
+            /(\s(?:src|href|action|data-src|data-href|poster)\s*=\s*)(["'])(\/(?!go\/)[^"']*)\2/gi,
+            function (_, pre, q, path) {
+                return pre + q + rewriteUrl(path) + q;
+            }
+        ).replace(
+            /(\s(?:src|href|action|data-src|data-href|poster)\s*=\s*)(\/(?!go\/)[^\s>]*)/gi,
+            function (_, pre, path) {
+                return pre + '"' + rewriteUrl(path) + '"';
+            }
+        );
+    }
+
+    try {
+        var mo = new MutationObserver(function (mutations) {
+            for (var i = 0; i < mutations.length; i++) {
+                var nodes = mutations[i].addedNodes;
+                for (var j = 0; j < nodes.length; j++) {
+                    fixTree(nodes[j]);
+                }
+            }
+        });
+        mo.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {}
+
+    try {
+        var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+        if (innerDesc && innerDesc.set) {
+            Object.defineProperty(Element.prototype, 'innerHTML', {
+                configurable: true,
+                enumerable: innerDesc.enumerable,
+                get: innerDesc.get,
+                set: function (v) {
+                    innerDesc.set.call(this, rewriteHtmlString(String(v)));
+                }
+            });
+        }
+    } catch (e) {}
+
+    try {
+        var origInsertAdjacentHTML = Element.prototype.insertAdjacentHTML;
+        Element.prototype.insertAdjacentHTML = function (position, html) {
+            return origInsertAdjacentHTML.call(this, position, rewriteHtmlString(String(html)));
+        };
+    } catch (e) {}
 
     function waitForElement(selector, timeout, interval) {
         timeout = timeout || 10000;

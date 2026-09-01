@@ -168,25 +168,22 @@ class ContentRewriter
      */
     public function rewriteHtml(string $html): string
     {
-        // 检查并处理 <base href="...">：如果存在，则只更新 base 的 href（将其指向代理前缀下的目标），
-        // 并且在页面其余位置跳过对相对路径的重写，依赖浏览器通过 base 来解析相对 URL。
-        preg_match('#<base[^>]*href=["\']([^"\']+)["\'][^>]*>#i', $html, $m);
-        $skipRelative = count($m) > 0;
-        if ($skipRelative) {
+        // 已有 <base>：更新其 href；没有则注入。相对路径仍显式重写，不依赖 base 兜底。
+        preg_match('#<base[^>]*href=(["\']?)([^"\'\s>]+)\1[^>]*>#i', $html, $m);
+        $hadBase = count($m) > 0;
+        if ($hadBase) {
             $html = preg_replace(
-                '#(<base[^>]*href=["\'])([^"\']+)(["\'][^>]*>)#i',
-                '$1' . $this->rewriteUrl($m[1]) . '$3',
+                '#(<base[^>]*href=(["\']?))([^"\'\s>]+)(\2[^>]*>)#i',
+                '$1' . $this->rewriteUrl($m[2]) . '$4',
                 $html,
                 1
             ) ?? $html;
         }
 
-        // head 最前面钉死 UTF-8 + base + hook（微信登录页常把 charset 放在 title 后面）
         $baseTag = '';
-        if (!$skipRelative) {
+        if (!$hadBase) {
             $baseHref = rtrim($this->prefix, '/') . '/';
             $baseTag = '<base href="' . htmlspecialchars($baseHref, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">';
-            $skipRelative = true;
         }
 
         $headInject = '<meta charset="utf-8">' . $baseTag . $this->buildHookScript();
@@ -195,44 +192,34 @@ class ContentRewriter
             $html = preg_replace('#<body[^>]*>#i', '$0' . $headInject, $html, 1) ?? ($headInject . $html);
         }
 
-        // OpenList / AList / Nuxt：修正 SPA base
         $html = $this->patchSpaBasePath($html);
         $html = preg_replace('#</head>#i', $this->buildSpaBasePatchScript() . '</head>', $html, 1) ?? $html;
 
-        // 重写 src / href / action / data-src 属性
+        // 去掉 HTML 内嵌 CSP，否则会拦 hook / eruda 等注入脚本
+        $html = $this->stripCspMeta($html);
+
+        // 根路径 /qms/... 会忽略 <base>，必须显式改写。= 两侧允许空白；值可无引号。
+        $html = $this->rewriteUrlAttributes($html);
+        $html = $this->rewriteSrcsetAttributes($html);
+
         $html = preg_replace_callback(
-            '#\s(src|href|action|data-src)=["\']([^"\']+)["\']#i',
-            function ($m) use ($skipRelative) {
-                $attr = $m[1];
-                $val = $m[2];
-                if ($skipRelative && $this->isRelativeUrl($val)) {
-                    return ' ' . $attr . '="' . $val . '"';
-                }
-                return ' ' . $attr . '="' . $this->rewriteUrl($val) . '"';
+            '#style=(?:"([^"]*url\([^)]+\)[^"]*)"|\'([^\']*url\([^)]+\)[^\']*)\')#i',
+            function ($m) {
+                $css = ($m[1] ?? null) !== null && $m[1] !== '' ? $m[1] : ($m[2] ?? '');
+                return 'style="' . $this->rewriteCss($css) . '"';
             },
             $html
-        );
+        ) ?? $html;
 
-        // 重写内联样式中的 url()
-        $html = preg_replace_callback(
-            '#style=["\']([^"\']*url\([^)]+\)[^"\']*)["\']#i',
-            function ($m) use ($skipRelative) {
-                return 'style="' . $this->rewriteCss($m[1], $skipRelative) . '"';
-            },
-            $html
-        );
-
-        // 重写 <style> 标签内的 CSS 内容
         $html = preg_replace_callback(
             '#<style[^>]*>(.*?)</style>#is',
-            function ($m) use ($skipRelative) {
+            function ($m) {
                 return '<style' . substr($m[0], 6, strpos($m[0], '>') - 6) . '>' .
-                       $this->rewriteCss($m[1], $skipRelative) . '</style>';
+                       $this->rewriteCss($m[1]) . '</style>';
             },
             $html
-        );
+        ) ?? $html;
 
-        // meta refresh 跳转
         $html = preg_replace_callback(
             '#<meta\b[^>]*http-equiv=["\']refresh["\'][^>]*content=["\']([^"\']+)["\'][^>]*>#i',
             function ($m) {
@@ -249,9 +236,75 @@ class ContentRewriter
                 ) ?? $m[0];
             },
             $html
-        );
+        ) ?? $html;
+
+        // 兜底：任何仍指向站点根绝对路径的 src/href（不含已是 /go/ 的）
+        $html = $this->sweepRootAbsoluteUrls($html);
 
         return $html;
+    }
+
+    /**
+     * 删除 meta Content-Security-Policy，避免拦代理注入的 inline / 外链脚本。
+     */
+    private function stripCspMeta(string $html): string
+    {
+        $out = preg_replace(
+            '#<meta\b[^>]*http-equiv\s*=\s*["\']?\s*Content-Security-Policy[^>]*>#i',
+            '',
+            $html
+        );
+
+        return $out ?? $html;
+    }
+
+    /**
+     * 重写 HTML 标签上的 URL 属性。用整段值捕获，避免可选分组下标在 ErrorHandler 下炸回调。
+     */
+    private function rewriteUrlAttributes(string $html): string
+    {
+        $pattern = '#(\s(?:src|href|action|data-src|data-href|poster)\s*=\s*)("([^"]*)"|\'([^\']*)\'|([^\s>]+))#i';
+        $out = preg_replace_callback($pattern, function (array $m): string {
+            $raw = $m[2];
+            $first = $raw[0] ?? '';
+            $val = ($first === '"' || $first === "'") ? substr($raw, 1, -1) : $raw;
+            $rewritten = str_replace('"', '&quot;', $this->rewriteUrl($val));
+
+            return $m[1] . '"' . $rewritten . '"';
+        }, $html);
+
+        return $out ?? $html;
+    }
+
+    private function rewriteSrcsetAttributes(string $html): string
+    {
+        $pattern = '#(\ssrcset\s*=\s*)("([^"]*)"|\'([^\']*)\'|([^\s>]+))#i';
+        $out = preg_replace_callback($pattern, function (array $m): string {
+            $raw = $m[2];
+            $first = $raw[0] ?? '';
+            $val = ($first === '"' || $first === "'") ? substr($raw, 1, -1) : $raw;
+            $rewritten = str_replace('"', '&quot;', $this->rewriteSrcset($val));
+
+            return $m[1] . '"' . $rewritten . '"';
+        }, $html);
+
+        return $out ?? $html;
+    }
+
+    /**
+     * 扫尾：漏网的 src="/qms/..."、href='/x' 等根绝对路径。
+     */
+    private function sweepRootAbsoluteUrls(string $html): string
+    {
+        $out = preg_replace_callback(
+            '#(\b(?:src|href|action|data-src|data-href|poster)\s*=\s*)(["\'])(/(?!go/)[^"\']*)\2#i',
+            function (array $m): string {
+                return $m[1] . $m[2] . $this->rewriteUrl($m[3]) . $m[2];
+            },
+            $html
+        );
+
+        return $out ?? $html;
     }
 
     /**
@@ -339,15 +392,40 @@ class ContentRewriter
                 return 'url("' . $this->rewriteUrl($url) . '")';
             },
             $css
-        );
+        ) ?? $css;
+    }
+
+    private function rewriteSrcset(string $srcset): string
+    {
+        $parts = preg_split('/\s*,\s*/', trim($srcset));
+        if ($parts === false) {
+            return $srcset;
+        }
+
+        $out = [];
+        foreach ($parts as $part) {
+            $part = trim($part);
+            if ($part === '') {
+                continue;
+            }
+            if (preg_match('#^(\S+)(\s+.+)?$#', $part, $m)) {
+                $out[] = $this->rewriteUrl($m[1]) . ($m[2] ?? '');
+            } else {
+                $out[] = $part;
+            }
+        }
+
+        return implode(', ', $out);
     }
 
     /**
      * 重写 JS/JSON 内容中的目标站点 URL
      *
-     * 仅替换完整的目标 origin，避免用正则扫描引号内路径——
-     * 那会误伤 highlight.js 等库里的 /"/,end:/"/ 语法。
-     * 绝对路径（/api/...）由页面 hook.js 在运行时改写 fetch/XHR/DOM。
+     * 只做目标 origin 的精确字符串替换。
+     * 禁止对 JS 扫 https:// 或 "/xxx.js"：
+     * - 会误伤 encoding 库字符表、正则字面量、模板字符串
+     * - 会把二进制/非 UTF-8 字节流搞成乱码
+     * 绝对路径与跨域请求由 hook.js 在运行时改写。
      *
      * @param  string $content 原始 JS 或 JSON 内容
      * @return string 重写后的内容
@@ -359,22 +437,19 @@ class ContentRewriter
             $content = str_replace($origin, $replacement, $content);
         }
 
-        $content = preg_replace_callback(
-            '#https?://[^\s"\'<>\\\\]+#',
-            function (array $m): string {
-                return $this->rewriteAbsoluteUrl($m[0]);
-            },
-            $content
-        ) ?? $content;
-
         return $content;
     }
 
     /**
      * 将任意 http(s) URL 转为代理路径（含其它 CDN 子域）。
+     * 动态/非法 host（模板字符串、占位符）一律原样返回。
      */
     private function rewriteAbsoluteUrl(string $url): string
     {
+        if (str_contains($url, '${') || str_contains($url, '`')) {
+            return $url;
+        }
+
         $normalized = $url;
         if (preg_match('#^//#', $normalized)) {
             $normalized = 'https:' . $normalized;
@@ -398,7 +473,15 @@ class ContentRewriter
             return $url;
         }
 
-        $host = $parts['host'];
+        $hostOnly = (string)$parts['host'];
+        if (preg_match('/[${}<>\s]/', $hostOnly)) {
+            return $url;
+        }
+        if (!$this->isRewritableHost($hostOnly)) {
+            return $url;
+        }
+
+        $host = $hostOnly;
         if (isset($parts['port'])) {
             $defaultPort = $scheme === 'https' ? 443 : 80;
             if ((int)$parts['port'] !== $defaultPort) {
@@ -416,6 +499,18 @@ class ContentRewriter
         $goPath = '/go/' . $scheme . '/' . $host . $path . $query . $fragment;
 
         return $this->proxyOrigin !== '' ? $this->proxyOrigin . $goPath : $goPath;
+    }
+
+    private function isRewritableHost(string $host): bool
+    {
+        if ($host === 'localhost') {
+            return true;
+        }
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            return true;
+        }
+
+        return filter_var($host, FILTER_VALIDATE_DOMAIN, FILTER_FLAG_HOSTNAME) !== false;
     }
 
     private function isAlreadyProxied(string $url): bool
