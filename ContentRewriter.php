@@ -16,7 +16,7 @@ use nova\framework\core\Logger;
  * - 相对路径（./path, ../path）-> 解析为绝对路径后加 prefix
  * - 同源完整URL（http://target/path）-> prefix + /path
  * - 同源协议相对URL（//target/path） -> prefix + /path
- * - 跨域完整URL              -> 不重写
+ * - 跨域完整URL              -> /go/{scheme}/{host}/... 代理路径
  * - data: / javascript: / mailto: / # -> 不重写
  * - JS/JSON                  -> 仅替换目标 origin（运行时路径由 hook.js 处理）
  */
@@ -181,36 +181,30 @@ class ContentRewriter
             ) ?? $html;
         }
 
-        // 1. 注入请求 hook 脚本（在 <head> 标签之后立即插入；无 head 则退到 body 开头）
-        $hookScript = $this->buildHookScript();
-        $html = preg_replace('#<head[^>]*>#i', '$0' . $hookScript, $html, 1, $hookCount) ?? $html;
-        if ($hookCount === 0) {
-            $html = preg_replace('#<body[^>]*>#i', '$0' . $hookScript, $html, 1) ?? ($hookScript . $html);
-        }
-
-        // 1b. 无 <base> 时注入，让相对资源与部分 SPA 路由以代理前缀为根
+        // head 最前面钉死 UTF-8 + base + hook（微信登录页常把 charset 放在 title 后面）
+        $baseTag = '';
         if (!$skipRelative) {
             $baseHref = rtrim($this->prefix, '/') . '/';
-            $html = preg_replace(
-                '#<head([^>]*)>#i',
-                '<head$1><base href="' . htmlspecialchars($baseHref, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">',
-                $html,
-                1
-            ) ?? $html;
+            $baseTag = '<base href="' . htmlspecialchars($baseHref, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">';
             $skipRelative = true;
         }
 
-        // 1c. OpenList / AList：把 base_path 从 / 改为代理前缀，否则 pathname 会被当成目录路径
+        $headInject = '<meta charset="utf-8">' . $baseTag . $this->buildHookScript();
+        $html = preg_replace('#<head[^>]*>#i', '$0' . $headInject, $html, 1, $hookCount) ?? $html;
+        if ($hookCount === 0) {
+            $html = preg_replace('#<body[^>]*>#i', '$0' . $headInject, $html, 1) ?? ($headInject . $html);
+        }
+
+        // OpenList / AList / Nuxt：修正 SPA base
         $html = $this->patchSpaBasePath($html);
         $html = preg_replace('#</head>#i', $this->buildSpaBasePatchScript() . '</head>', $html, 1) ?? $html;
 
-        // 2. 重写 src / href / action / data-src 属性
+        // 重写 src / href / action / data-src 属性
         $html = preg_replace_callback(
             '#\s(src|href|action|data-src)=["\']([^"\']+)["\']#i',
             function ($m) use ($skipRelative) {
                 $attr = $m[1];
                 $val = $m[2];
-                // 如果开启了跳过相对 URL 且该 URL 为相对路径，则不修改
                 if ($skipRelative && $this->isRelativeUrl($val)) {
                     return ' ' . $attr . '="' . $val . '"';
                 }
@@ -219,7 +213,7 @@ class ContentRewriter
             $html
         );
 
-        // 3. 重写内联样式中的 url()
+        // 重写内联样式中的 url()
         $html = preg_replace_callback(
             '#style=["\']([^"\']*url\([^)]+\)[^"\']*)["\']#i',
             function ($m) use ($skipRelative) {
@@ -228,7 +222,7 @@ class ContentRewriter
             $html
         );
 
-        // 4. 重写 <style> 标签内的 CSS 内容
+        // 重写 <style> 标签内的 CSS 内容
         $html = preg_replace_callback(
             '#<style[^>]*>(.*?)</style>#is',
             function ($m) use ($skipRelative) {
@@ -238,7 +232,7 @@ class ContentRewriter
             $html
         );
 
-        // 5. meta refresh 跳转
+        // meta refresh 跳转
         $html = preg_replace_callback(
             '#<meta\b[^>]*http-equiv=["\']refresh["\'][^>]*content=["\']([^"\']+)["\'][^>]*>#i',
             function ($m) {
@@ -282,22 +276,31 @@ class ContentRewriter
     }
 
     /**
-     * 将 HTML 内联脚本中的 SPA base_path（/）替换为代理前缀。
-     * 主要适配 OpenList / AList；它们用 base_path 解析 pathname，不设则会把整个 /go/... 当目录。
+     * 将 HTML 内联配置中的 SPA 根路径替换为代理前缀。
+     * 适配 OpenList/AList(base_path)、Nuxt(baseURL)。
      */
     private function patchSpaBasePath(string $html): string
     {
         $basePath = rtrim($this->prefix, '/') . '/';
 
-        return preg_replace(
+        $html = preg_replace(
             '#(base_path\s*:\s*)(["\'])/\2#',
             '$1$2' . $basePath . '$2',
             $html
         ) ?? $html;
+
+        // Nuxt: "baseURL":"/" / baseURL:"/"
+        $html = preg_replace(
+            '#(["\']?baseURL["\']?\s*:\s*)(["\'])/\2#',
+            '$1$2' . $basePath . '$2',
+            $html
+        ) ?? $html;
+
+        return $html;
     }
 
     /**
-     * 在 </head> 前注入兜底脚本：内联 config 已执行后再强制覆盖 base_path。
+     * 在 </head> 前注入兜底脚本：强制覆盖常见 SPA 的 base 配置。
      */
     private function buildSpaBasePatchScript(): string
     {
@@ -305,7 +308,11 @@ class ContentRewriter
 
         return '<script>(function(){var p=' . $basePath . ';'
             . 'if(window.OPENLIST_CONFIG)window.OPENLIST_CONFIG.base_path=p;'
-            . 'if(window.ALIST_CONFIG)window.ALIST_CONFIG.base_path=p;})();</script>';
+            . 'if(window.ALIST_CONFIG)window.ALIST_CONFIG.base_path=p;'
+            . 'function n(o){try{if(o&&o.config&&o.config.app)o.config.app.baseURL=p;}catch(e){}}'
+            . 'if(window.__NUXT__)n(window.__NUXT__);'
+            . 'document.addEventListener("DOMContentLoaded",function(){if(window.__NUXT__)n(window.__NUXT__);});'
+            . '})();</script>';
     }
 
     /**
@@ -352,7 +359,72 @@ class ContentRewriter
             $content = str_replace($origin, $replacement, $content);
         }
 
+        $content = preg_replace_callback(
+            '#https?://[^\s"\'<>\\\\]+#',
+            function (array $m): string {
+                return $this->rewriteAbsoluteUrl($m[0]);
+            },
+            $content
+        ) ?? $content;
+
         return $content;
+    }
+
+    /**
+     * 将任意 http(s) URL 转为代理路径（含其它 CDN 子域）。
+     */
+    private function rewriteAbsoluteUrl(string $url): string
+    {
+        $normalized = $url;
+        if (preg_match('#^//#', $normalized)) {
+            $normalized = 'https:' . $normalized;
+        }
+
+        if (!preg_match('#^https?://#i', $normalized)) {
+            return $url;
+        }
+
+        if ($this->isAlreadyProxied($normalized)) {
+            return $url;
+        }
+
+        $parts = parse_url($normalized);
+        if ($parts === false || empty($parts['host'])) {
+            return $url;
+        }
+
+        $scheme = strtolower($parts['scheme'] ?? 'https');
+        if ($scheme !== 'http' && $scheme !== 'https') {
+            return $url;
+        }
+
+        $host = $parts['host'];
+        if (isset($parts['port'])) {
+            $defaultPort = $scheme === 'https' ? 443 : 80;
+            if ((int)$parts['port'] !== $defaultPort) {
+                $host .= ':' . $parts['port'];
+            }
+        }
+
+        $path = $parts['path'] ?? '/';
+        if ($path === '') {
+            $path = '/';
+        }
+        $query = isset($parts['query']) ? '?' . $parts['query'] : '';
+        $fragment = isset($parts['fragment']) ? '#' . $parts['fragment'] : '';
+
+        $goPath = '/go/' . $scheme . '/' . $host . $path . $query . $fragment;
+
+        return $this->proxyOrigin !== '' ? $this->proxyOrigin . $goPath : $goPath;
+    }
+
+    private function isAlreadyProxied(string $url): bool
+    {
+        if ($this->proxyOrigin !== '' && str_starts_with($url, $this->proxyOrigin . '/go/')) {
+            return true;
+        }
+
+        return (bool) preg_match('#(?:^|//[^/]+)/go/(https?)/#i', $url);
     }
 
     /**
@@ -360,8 +432,8 @@ class ContentRewriter
      *
      * 判断逻辑（按优先级）：
      * 1. 空URL / 锚点(#) / data: / javascript: / mailto: -> 不重写
-     * 2. 完整URL(http(s)://) -> 匹配目标 origin 则替换为 prefix + path，否则不重写
-     * 3. 协议相对URL(//) -> 匹配目标 origin 则替换为 prefix + path，否则不重写
+     * 2. 完整URL(http(s)://) -> 同源走 prefix，其它域名走 /go/{scheme}/{host}/...
+     * 3. 协议相对URL(//) -> 同上
      * 4. 绝对路径(/) -> prefix + path
      * 5. 相对路径(path / ./path / ../path) -> 解析为绝对路径后加 prefix
      *
@@ -381,8 +453,12 @@ class ContentRewriter
             return $url;
         }
 
-        // 2. 完整URL 或 协议相对URL：遍历所有目标 origin 进行匹配
+        // 2. 完整URL 或 协议相对URL：先匹配当前页同源，其余 http(s) 也走 /go/
         if (preg_match('#^(?:https?:)?//#i', $url)) {
+            if ($this->isAlreadyProxied($url)) {
+                return $url;
+            }
+
             foreach ($this->targetOrigins as $origin) {
                 if (str_starts_with($url, $origin)) {
                     $path = substr($url, strlen($origin));
@@ -390,8 +466,8 @@ class ContentRewriter
                     return $this->proxyOrigin . $this->prefix . $path;
                 }
             }
-            // 跨域资源，不重写
-            return $url;
+
+            return $this->rewriteAbsoluteUrl($url);
         }
 
         // 3. 绝对路径（/path）

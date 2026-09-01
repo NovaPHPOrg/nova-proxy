@@ -20,6 +20,14 @@
             return url;
         }
 
+        // Already /go/{scheme}/{host}/... — do not stack page prefix again
+        if (isAlreadyProxied(url)) {
+            if (url.startsWith(CURRENT_ORIGIN + '/')) {
+                return url.substring(CURRENT_ORIGIN.length);
+            }
+            return url;
+        }
+
         for (var i = 0; i < TARGET_ORIGINS.length; i++) {
             var origin = TARGET_ORIGINS[i];
             if (url.startsWith(origin)) {
@@ -36,11 +44,18 @@
             if (localPath.startsWith(PROXY_PREFIX + '/') || localPath === PROXY_PREFIX) {
                 return localPath;
             }
+            if (isAlreadyProxied(localPath)) {
+                return localPath;
+            }
             return PROXY_PREFIX + localPath;
         }
 
-        if (url.startsWith('http://') || url.startsWith('https://')) return url;
-        if (url.startsWith('//')) return url;
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+            return toGoPath(url) || url;
+        }
+        if (url.startsWith('//')) {
+            return toGoPath('https:' + url) || url;
+        }
 
         if (url.startsWith('/')) {
             return PROXY_PREFIX + url;
@@ -48,6 +63,124 @@
 
         return url;
     }
+
+    function isAlreadyProxied(url) {
+        if (url.startsWith(CURRENT_ORIGIN + '/go/http') || url.startsWith(CURRENT_ORIGIN + '/go/https')) {
+            return true;
+        }
+        if (url.startsWith('/go/http') || url.startsWith('/go/https')) {
+            return true;
+        }
+        return /(?:^|\/\/[^/]+)\/go\/https?\//i.test(url);
+    }
+
+    function toGoPath(absoluteUrl) {
+        try {
+            var u = new URL(absoluteUrl);
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') {
+                return null;
+            }
+            var path = u.pathname || '/';
+            return '/go/' + u.protocol.replace(':', '') + '/' + u.host + path + u.search + u.hash;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // SPA apps read location.pathname; strip proxy prefix so routes stay site-rooted.
+    var PREFIX_ROOT = PROXY_PREFIX.replace(/\/$/, '');
+
+    function stripProxyPrefix(path) {
+        if (!path || typeof path !== 'string') {
+            return path;
+        }
+        if (path === PREFIX_ROOT || path === PREFIX_ROOT + '/') {
+            return '/';
+        }
+        if (path.indexOf(PREFIX_ROOT + '/') === 0) {
+            return path.substring(PREFIX_ROOT.length) || '/';
+        }
+        return path;
+    }
+
+    function patchNuxtBase(obj) {
+        try {
+            if (obj && obj.config && obj.config.app) {
+                obj.config.app.baseURL = PREFIX_ROOT + '/';
+            }
+        } catch (e) {}
+        return obj;
+    }
+
+    try {
+        var pathDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'pathname');
+        if (pathDesc && pathDesc.get) {
+            Object.defineProperty(Location.prototype, 'pathname', {
+                configurable: true,
+                enumerable: true,
+                get: function () {
+                    return stripProxyPrefix(pathDesc.get.call(this));
+                }
+            });
+        }
+    } catch (e) {}
+
+    try {
+        var hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+        if (hrefDesc && hrefDesc.get && hrefDesc.set) {
+            Object.defineProperty(Location.prototype, 'href', {
+                configurable: true,
+                enumerable: true,
+                get: function () {
+                    var raw = hrefDesc.get.call(this);
+                    try {
+                        var u = new URL(raw);
+                        u.pathname = stripProxyPrefix(u.pathname);
+                        return u.href;
+                    } catch (err) {
+                        return raw;
+                    }
+                },
+                set: function (v) {
+                    hrefDesc.set.call(this, rewriteUrl(String(v)));
+                }
+            });
+        }
+    } catch (e) {}
+
+    try {
+        var origPushState = history.pushState;
+        history.pushState = function (state, title, url) {
+            if (url != null && url !== '') {
+                url = rewriteUrl(String(url));
+            }
+            return origPushState.call(this, state, title, url);
+        };
+        var origReplaceState = history.replaceState;
+        history.replaceState = function (state, title, url) {
+            if (url != null && url !== '') {
+                url = rewriteUrl(String(url));
+            }
+            return origReplaceState.call(this, state, title, url);
+        };
+    } catch (e) {}
+
+    try {
+        var nuxtValue = window.__NUXT__;
+        Object.defineProperty(window, '__NUXT__', {
+            configurable: true,
+            enumerable: true,
+            get: function () {
+                return nuxtValue;
+            },
+            set: function (v) {
+                nuxtValue = patchNuxtBase(v);
+            }
+        });
+        if (nuxtValue) {
+            patchNuxtBase(nuxtValue);
+        }
+    } catch (e) {}
 
     var originalFetch = window.fetch;
     window.fetch = function(input, init) {

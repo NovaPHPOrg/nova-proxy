@@ -256,6 +256,12 @@ class ProxyResponse extends Response
         $headersResult = $this->responseReader->readHeadersOnly($socket);
         $headers = $headersResult;
 
+        // HEAD：上游通常无 body，禁止缓冲后写成 Content-Length: 0
+        if (strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'HEAD') {
+            $this->sendStreamHeaders($headers);
+            return;
+        }
+
         // 仅 HTML 需要注入（返回按钮 / 调试工具）；勿因 injector 缓冲图片等二进制
         $needBuffer = $headers['needsRewrite']
             || ($this->responseInjector !== null && !empty($headers['html']));
@@ -278,6 +284,9 @@ class ProxyResponse extends Response
     private function sendStreamHeaders(array $headers): void
     {
         foreach ($headers['lines'] as $line) {
+            if ($this->shouldSkipResponseHeader($line)) {
+                continue;
+            }
             if (stripos($line, 'Location:') === 0) {
                 $location = trim(substr($line, 9));
                 header('Location: ' . $this->urlRewriter->rewriteLocation($location));
@@ -305,14 +314,16 @@ class ProxyResponse extends Response
         }
 
         $contentType = $this->getContentType($headers['lines']);
+        $isHtml = str_contains(strtolower($contentType), 'text/html');
         if (self::isTextual($contentType)) {
             $charset = CharsetNormalizer::detect($contentType, $body);
             if ($charset !== 'UTF-8') {
                 $body = CharsetNormalizer::toUtf8($body, $charset);
-                CharsetNormalizer::applyUtf8Headers($headers['lines']);
-                if (str_contains(strtolower($contentType), 'text/html')) {
-                    $body = CharsetNormalizer::applyUtf8Meta($body);
-                }
+            }
+            // 无论上游 Content-Type 是否声称 GBK，重写后的正文统一按 UTF-8 输出
+            CharsetNormalizer::applyUtf8Headers($headers['lines']);
+            if ($isHtml) {
+                $body = CharsetNormalizer::applyUtf8Meta($body);
             }
         }
 
@@ -358,6 +369,9 @@ class ProxyResponse extends Response
         // 重写后的 body 已是明文。禁止再标 Content-Encoding:gzip，
         // 否则叠加 PHP zlib.output_compression 会双重压缩 → 浏览器乱码。
         foreach ($headers['lines'] as $line) {
+            if ($this->shouldSkipResponseHeader($line)) {
+                continue;
+            }
             if (stripos($line, 'Content-Encoding:') === 0) {
                 continue;
             }
@@ -455,5 +469,15 @@ class ProxyResponse extends Response
         }
 
         return $scheme . '://' . $host . $portStr;
+    }
+
+    /** 去掉上游站点 CORS 限制，避免 CDN 资源经代理后仍被浏览器拦截。 */
+    private function shouldSkipResponseHeader(string $line): bool
+    {
+        return stripos($line, 'Access-Control-Allow-Origin:') === 0
+            || stripos($line, 'Access-Control-Allow-Credentials:') === 0
+            || stripos($line, 'Access-Control-Allow-Methods:') === 0
+            || stripos($line, 'Access-Control-Allow-Headers:') === 0
+            || stripos($line, 'Access-Control-Expose-Headers:') === 0;
     }
 }

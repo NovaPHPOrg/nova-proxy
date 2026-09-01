@@ -112,18 +112,17 @@ class HttpRequestBuilder
 
     private function rewriteReferer(string $referer, array $urlInfo): string
     {
-        if ($referer === '' || $this->proxyPrefix === '' || $this->proxyOrigin === '') {
+        if ($referer === '' || $this->proxyOrigin === '') {
             return $referer;
         }
 
-        $proxyBase = rtrim($this->proxyOrigin, '/') . $this->proxyPrefix;
-        if (str_starts_with($referer, $proxyBase)) {
-            $path = substr($referer, strlen($proxyBase)) ?: '/';
-            return $this->targetOrigin($urlInfo) . $path;
+        $mapped = $this->mapProxyUrlToTarget($referer);
+        if ($mapped !== null) {
+            return $mapped;
         }
 
-        $proxyRoot = rtrim($this->proxyOrigin, '/') . '/';
-        if ($referer === $proxyRoot || $referer === rtrim($this->proxyOrigin, '/')) {
+        $proxyRoot = rtrim($this->proxyOrigin, '/');
+        if ($referer === $proxyRoot || $referer === $proxyRoot . '/') {
             return $this->targetOrigin($urlInfo) . '/';
         }
 
@@ -136,17 +135,52 @@ class HttpRequestBuilder
             return $origin;
         }
 
+        $mapped = $this->mapProxyUrlToTarget($origin);
+        if ($mapped !== null) {
+            $parts = parse_url($mapped);
+            if ($parts !== false && !empty($parts['host'])) {
+                $scheme = strtolower((string)($parts['scheme'] ?? 'https'));
+                $host = $parts['host'];
+                $port = $parts['port'] ?? null;
+                $defaultPort = $scheme === 'https' ? 443 : 80;
+                $portStr = ($port !== null && (int)$port !== $defaultPort) ? ':' . $port : '';
+                return $scheme . '://' . $host . $portStr;
+            }
+        }
+
         $proxyRoot = rtrim($this->proxyOrigin, '/');
         if ($origin === $proxyRoot || $origin === $proxyRoot . '/') {
             return $this->targetOrigin($urlInfo);
         }
 
-        $proxyBase = $proxyRoot . $this->proxyPrefix;
-        if (str_starts_with($origin, $proxyBase)) {
-            return $this->targetOrigin($urlInfo);
+        return $origin;
+    }
+
+    /**
+     * 把 https://proxy/go/{scheme}/{host}/path 还原为 https://host/path。
+     * 必须识别任意被代理 host，不能只认当前请求的 prefix——
+     * 否则从 weread 页加载 CDN 时 Referer 仍是 proxy 地址。
+     */
+    private function mapProxyUrlToTarget(string $url): ?string
+    {
+        $proxyRoot = rtrim($this->proxyOrigin, '/');
+        if (!str_starts_with($url, $proxyRoot . '/go/')) {
+            return null;
         }
 
-        return $origin;
+        $rest = substr($url, strlen($proxyRoot));
+        if (!preg_match('#^/go/(https?)/([^/]+)(/.*)?$#i', $rest, $m)) {
+            return null;
+        }
+
+        $scheme = strtolower($m[1]);
+        $host = $m[2];
+        $path = $m[3] ?? '/';
+        if ($path === '') {
+            $path = '/';
+        }
+
+        return $scheme . '://' . $host . $path;
     }
 
     private function targetOrigin(array $urlInfo): string
