@@ -18,7 +18,7 @@ use nova\framework\core\Logger;
  * - 同源协议相对URL（//target/path） -> prefix + /path
  * - 跨域完整URL              -> 不重写
  * - data: / javascript: / mailto: / # -> 不重写
- * - JS/JSON                  -> 替换目标 origin 与引号包裹的绝对路径
+ * - JS/JSON                  -> 仅替换目标 origin（运行时路径由 hook.js 处理）
  */
 class ContentRewriter
 {
@@ -158,7 +158,8 @@ class ContentRewriter
      *
      * 处理以下场景：
      * 1. 在 <head> 开头注入 fetch/XHR hook 脚本，拦截客户端动态请求
-     * 2. 重写 src / href / action 属性中的 URL
+     * 2. 无 <base> 时注入 base href，并修正 OpenList/AList 等 SPA 的 base_path
+     * 3. 重写 src / href / action 属性中的 URL
      * 3. 重写内联 style 属性中的 url() 引用
      * 4. 重写 <style> 标签内的 CSS url() 引用
      *
@@ -180,9 +181,28 @@ class ContentRewriter
             ) ?? $html;
         }
 
-        // 1. 注入请求 hook 脚本（在 <head> 标签之后立即插入）
+        // 1. 注入请求 hook 脚本（在 <head> 标签之后立即插入；无 head 则退到 body 开头）
         $hookScript = $this->buildHookScript();
-        $html = preg_replace('#<head[^>]*>#i', '$0' . $hookScript, $html, 1);
+        $html = preg_replace('#<head[^>]*>#i', '$0' . $hookScript, $html, 1, $hookCount) ?? $html;
+        if ($hookCount === 0) {
+            $html = preg_replace('#<body[^>]*>#i', '$0' . $hookScript, $html, 1) ?? ($hookScript . $html);
+        }
+
+        // 1b. 无 <base> 时注入，让相对资源与部分 SPA 路由以代理前缀为根
+        if (!$skipRelative) {
+            $baseHref = rtrim($this->prefix, '/') . '/';
+            $html = preg_replace(
+                '#<head([^>]*)>#i',
+                '<head$1><base href="' . htmlspecialchars($baseHref, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">',
+                $html,
+                1
+            ) ?? $html;
+            $skipRelative = true;
+        }
+
+        // 1c. OpenList / AList：把 base_path 从 / 改为代理前缀，否则 pathname 会被当成目录路径
+        $html = $this->patchSpaBasePath($html);
+        $html = preg_replace('#</head>#i', $this->buildSpaBasePatchScript() . '</head>', $html, 1) ?? $html;
 
         // 2. 重写 src / href / action / data-src 属性
         $html = preg_replace_callback(
@@ -262,6 +282,33 @@ class ContentRewriter
     }
 
     /**
+     * 将 HTML 内联脚本中的 SPA base_path（/）替换为代理前缀。
+     * 主要适配 OpenList / AList；它们用 base_path 解析 pathname，不设则会把整个 /go/... 当目录。
+     */
+    private function patchSpaBasePath(string $html): string
+    {
+        $basePath = rtrim($this->prefix, '/') . '/';
+
+        return preg_replace(
+            '#(base_path\s*:\s*)(["\'])/\2#',
+            '$1$2' . $basePath . '$2',
+            $html
+        ) ?? $html;
+    }
+
+    /**
+     * 在 </head> 前注入兜底脚本：内联 config 已执行后再强制覆盖 base_path。
+     */
+    private function buildSpaBasePatchScript(): string
+    {
+        $basePath = json_encode(rtrim($this->prefix, '/') . '/', JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+
+        return '<script>(function(){var p=' . $basePath . ';'
+            . 'if(window.OPENLIST_CONFIG)window.OPENLIST_CONFIG.base_path=p;'
+            . 'if(window.ALIST_CONFIG)window.ALIST_CONFIG.base_path=p;})();</script>';
+    }
+
+    /**
      * 重写 CSS 内容中的 url() 引用
      *
      * 支持以下格式：
@@ -291,10 +338,9 @@ class ContentRewriter
     /**
      * 重写 JS/JSON 内容中的目标站点 URL
      *
-     * 通过字符串替换将所有目标 origin（含协议相对形式和替代协议）替换为代理前缀。
-     * 例如：
-     * - "https://example.com/api/data" -> "/proxy/https/example.com/api/data"
-     * - "//example.com/api/data"       -> "/proxy/https/example.com/api/data"
+     * 仅替换完整的目标 origin，避免用正则扫描引号内路径——
+     * 那会误伤 highlight.js 等库里的 /"/,end:/"/ 语法。
+     * 绝对路径（/api/...）由页面 hook.js 在运行时改写 fetch/XHR/DOM。
      *
      * @param  string $content 原始 JS 或 JSON 内容
      * @return string 重写后的内容
@@ -305,23 +351,6 @@ class ContentRewriter
         foreach ($this->targetOrigins as $origin) {
             $content = str_replace($origin, $replacement, $content);
         }
-
-        $prefix = $this->prefix;
-        $content = preg_replace_callback(
-            '#(["\'])(/[^"\']*)\1#',
-            function (array $m) use ($prefix): string {
-                $path = $m[2];
-                if ($path === '/' ||
-                    str_starts_with($path, '//') ||
-                    str_starts_with($path, $prefix . '/') ||
-                    $path === $prefix) {
-                    return $m[0];
-                }
-
-                return $m[1] . $prefix . $path . $m[1];
-            },
-            $content
-        );
 
         return $content;
     }
