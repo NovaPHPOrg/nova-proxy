@@ -50,7 +50,7 @@ class ProxyResponse extends Response
         ];
 
         // 初始化协作类
-        $this->requestBuilder  = new HttpRequestBuilder();
+        $this->requestBuilder  = new HttpRequestBuilder($proxyPrefix, $this->extractOrigin($fullPath));
         $this->responseReader  = new HttpResponseReader();
         $this->urlRewriter     = new ProxyUrlRewriter($uri, $fullPath, $proxyPrefix);
         $this->contentRewriter = new ContentRewriter($proxyPrefix, $uri, $fullPath);
@@ -434,5 +434,26 @@ class ProxyResponse extends Response
         header('Content-Type: text/plain; charset=utf-8');
         echo 'WebSocket is not supported by this proxy.';
         flush();
+    }
+
+    private function extractOrigin(string $url): string
+    {
+        $parts = parse_url($url);
+        if ($parts === false || empty($parts['host'])) {
+            return '';
+        }
+
+        $scheme = strtolower($parts['scheme'] ?? 'https');
+        $host = $parts['host'];
+        $port = $parts['port'] ?? null;
+        $portStr = '';
+        if ($port !== null) {
+            $defaultPort = $scheme === 'https' ? 443 : 80;
+            if ((int)$port !== $defaultPort) {
+                $portStr = ':' . $port;
+            }
+        }
+
+        return $scheme . '://' . $host . $portStr;
     }
 }

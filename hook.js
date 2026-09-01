@@ -1,6 +1,6 @@
 (function() {
     var PROXY_PREFIX = '{{PREFIX}}';
-    var TARGET_ORIGINS = {{TARGET_ORIGINS}};
+    var TARGET_ORIGINS = '{{TARGET_ORIGINS}}';
     var CURRENT_ORIGIN = window.location.origin;
 
     function rewriteUrl(url) {

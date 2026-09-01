@@ -13,12 +13,18 @@ use function nova\framework\dump;
  */
 class HttpRequestBuilder
 {
+    public function __construct(
+        private string $proxyPrefix = '',
+        private string $proxyOrigin = '',
+    ) {
+    }
+
     /**
      * 构建请求头部分（不含请求体）
      */
-    public function buildHeader(array $urlInfo): string
+    public function buildHeader(array $urlInfo, array $extra = []): string
     {
-        $headers = $this->buildHeaders($urlInfo);
+        $headers = $this->buildHeaders($urlInfo, $extra);
         $uri     = $urlInfo['path'] . $urlInfo['query'];
 
 
@@ -61,18 +67,21 @@ class HttpRequestBuilder
         }
     }
 
-    private function buildHeaders(array $urlInfo): string
+    private function buildHeaders(array $urlInfo, array $extra = []): string
     {
         $scheme = strtolower((string)($urlInfo['scheme'] ?? 'http'));
         $defaultPort = $scheme === 'https' ? 443 : 80;
         $port = (int)($urlInfo['port'] ?? $defaultPort);
         $host = (string)$urlInfo['host'];
-        // 默认端口不要写进 Host，部分 CDN/源站会回奇怪页面
         if ($port !== $defaultPort) {
             $host .= ':' . $port;
         }
 
         $out = "Host: {$host}\r\n";
+
+        foreach ($extra as $name => $value) {
+            $out .= "{$name}: {$value}\r\n";
+        }
 
         foreach ($_SERVER as $k => $v) {
             if (!str_starts_with($k, 'HTTP_')) {
@@ -85,15 +94,70 @@ class HttpRequestBuilder
 
             $headerName = str_replace('_', '-', substr($k, 5));
 
-            // 强制只接受 gzip/deflate，PHP 没有内置 brotli 解码
             if ($headerName === 'ACCEPT-ENCODING') {
                 $out .= "Accept-Encoding: gzip, deflate\r\n";
                 continue;
             }
 
+            if ($headerName === 'REFERER') {
+                $v = $this->rewriteReferer((string)$v, $urlInfo);
+            } elseif ($headerName === 'ORIGIN') {
+                $v = $this->rewriteOrigin((string)$v, $urlInfo);
+            }
+
             $out .= "$headerName: $v\r\n";
         }
         return $out;
+    }
+
+    private function rewriteReferer(string $referer, array $urlInfo): string
+    {
+        if ($referer === '' || $this->proxyPrefix === '' || $this->proxyOrigin === '') {
+            return $referer;
+        }
+
+        $proxyBase = rtrim($this->proxyOrigin, '/') . $this->proxyPrefix;
+        if (str_starts_with($referer, $proxyBase)) {
+            $path = substr($referer, strlen($proxyBase)) ?: '/';
+            return $this->targetOrigin($urlInfo) . $path;
+        }
+
+        $proxyRoot = rtrim($this->proxyOrigin, '/') . '/';
+        if ($referer === $proxyRoot || $referer === rtrim($this->proxyOrigin, '/')) {
+            return $this->targetOrigin($urlInfo) . '/';
+        }
+
+        return $referer;
+    }
+
+    private function rewriteOrigin(string $origin, array $urlInfo): string
+    {
+        if ($origin === '' || $this->proxyOrigin === '') {
+            return $origin;
+        }
+
+        $proxyRoot = rtrim($this->proxyOrigin, '/');
+        if ($origin === $proxyRoot || $origin === $proxyRoot . '/') {
+            return $this->targetOrigin($urlInfo);
+        }
+
+        $proxyBase = $proxyRoot . $this->proxyPrefix;
+        if (str_starts_with($origin, $proxyBase)) {
+            return $this->targetOrigin($urlInfo);
+        }
+
+        return $origin;
+    }
+
+    private function targetOrigin(array $urlInfo): string
+    {
+        $scheme = strtolower((string)($urlInfo['scheme'] ?? 'https'));
+        $host = (string)($urlInfo['host'] ?? '');
+        $defaultPort = $scheme === 'https' ? 443 : 80;
+        $port = (int)($urlInfo['port'] ?? $defaultPort);
+        $portStr = $port !== $defaultPort ? ':' . $port : '';
+
+        return $scheme . '://' . $host . $portStr;
     }
 
     /**

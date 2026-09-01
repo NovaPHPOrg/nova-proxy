@@ -28,7 +28,7 @@ class ProxyUrlRewriter
     {
         $p = parse_url($url);
         return [
-            'scheme' => $p['scheme'] ?? 'https',
+            'scheme' => strtolower($p['scheme'] ?? 'https'),
             'host'   => $p['host'] ?? '',
             'port'   => $p['port'] ?? null,
         ];
@@ -44,23 +44,16 @@ class ProxyUrlRewriter
             return $location;
         }
 
-        // 解析 Location URL
         $parsed = $this->parseLocationUrl($location);
         if (!$parsed) {
-            return $location; // 无法解析，保持原样
+            return $location;
         }
 
-        // 检查是否需要重写（同域检查）
         if (!$this->isSameHost($parsed['host'])) {
-            return $location; // 非同域，不重写
+            return $location;
         }
 
-        // 重写 URL
-        return $this->buildProxyUrl(
-            $parsed['path'],
-            $parsed['query'],
-            $parsed['fragment']
-        );
+        return $this->buildProxyUrl($parsed);
     }
 
     /**
@@ -84,24 +77,48 @@ class ProxyUrlRewriter
 
     /**
      * 解析 Location URL（支持绝对、协议相对、根相对、相对路径）
+     *
+     * @return array{scheme:string,host:string,port:?int,path:string,query:string,fragment:string}|null
      */
     private function parseLocationUrl(string $location): ?array
     {
-        // 绝对 URL
         if (preg_match('#^https?://#i', $location)) {
             $p = parse_url($location);
-            return $p ? [
+            if ($p === false) {
+                return null;
+            }
+
+            return [
+                'scheme'   => strtolower($p['scheme'] ?? 'https'),
                 'host'     => $p['host'] ?? '',
+                'port'     => $p['port'] ?? null,
                 'path'     => $p['path'] ?? '/',
                 'query'    => isset($p['query']) ? '?' . $p['query'] : '',
                 'fragment' => isset($p['fragment']) ? '#' . $p['fragment'] : '',
-            ] : null;
+            ];
         }
 
-        // 根相对或相对路径
+        if (str_starts_with($location, '//')) {
+            $p = parse_url('https:' . $location);
+            if ($p === false) {
+                return null;
+            }
+
+            return [
+                'scheme'   => $this->targetUrl['scheme'],
+                'host'     => $p['host'] ?? '',
+                'port'     => $p['port'] ?? null,
+                'path'     => $p['path'] ?? '/',
+                'query'    => isset($p['query']) ? '?' . $p['query'] : '',
+                'fragment' => isset($p['fragment']) ? '#' . $p['fragment'] : '',
+            ];
+        }
+
         $p = parse_url($location);
         return [
+            'scheme'   => $this->targetUrl['scheme'],
             'host'     => $this->targetUrl['host'],
+            'port'     => $this->targetUrl['port'],
             'path'     => $p['path'] ?? '/',
             'query'    => isset($p['query']) ? '?' . $p['query'] : '',
             'fragment' => isset($p['fragment']) ? '#' . $p['fragment'] : '',
@@ -125,16 +142,29 @@ class ProxyUrlRewriter
     }
 
     /**
-     * 构建代理 URL（路径代理模式）
+     * 用 Location 里真实的 scheme/host 构建 /go/ 路径，避免 www 跳转被压回原 prefix 造成死循环。
+     *
+     * @param array{scheme:string,host:string,port:?int,path:string,query:string,fragment:string} $parsed
      */
-    private function buildProxyUrl(string $path, string $query, string $fragment): string
+    private function buildProxyUrl(array $parsed): string
     {
         $scheme  = $this->proxyUrl['scheme'];
         $host    = $this->proxyUrl['host'];
         $portStr = $this->formatPort($scheme, $this->proxyUrl['port']);
-        $path    = '/' . ltrim($path, '/'); // 统一处理：确保单斜杠
+        $path    = '/' . ltrim($parsed['path'], '/');
 
-        return "{$scheme}://{$host}{$portStr}{$this->proxyPrefix}{$path}{$query}{$fragment}";
+        $targetScheme = $parsed['scheme'];
+        $targetHost = $parsed['host'];
+        if (!empty($parsed['port'])) {
+            $defaultPort = $targetScheme === 'https' ? 443 : 80;
+            if ((int)$parsed['port'] !== $defaultPort) {
+                $targetHost .= ':' . $parsed['port'];
+            }
+        }
+
+        $prefix = '/go/' . $targetScheme . '/' . $targetHost;
+
+        return "{$scheme}://{$host}{$portStr}{$prefix}{$path}{$parsed['query']}{$parsed['fragment']}";
     }
 
     private function formatPort(string $scheme, ?int $port): string
