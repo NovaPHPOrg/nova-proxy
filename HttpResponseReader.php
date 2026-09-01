@@ -138,6 +138,8 @@ class HttpResponseReader
                     $needsRewrite = true;
                 } elseif (str_contains($ct, 'text/css') || str_contains($ct, 'application/css')) {
                     $needsRewrite = true;
+                } elseif (str_contains($ct, 'javascript') || str_contains($ct, 'json')) {
+                    $needsRewrite = true;
                 }
             }
 

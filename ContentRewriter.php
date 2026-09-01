@@ -18,7 +18,7 @@ use nova\framework\core\Logger;
  * - 同源协议相对URL（//target/path） -> prefix + /path
  * - 跨域完整URL              -> 不重写
  * - data: / javascript: / mailto: / # -> 不重写
- * - JS/JSON                  -> 不重写（通过注入的 hook 脚本在客户端拦截）
+ * - JS/JSON                  -> 替换目标 origin 与引号包裹的绝对路径
  */
 class ContentRewriter
 {
@@ -171,14 +171,22 @@ class ContentRewriter
         // 并且在页面其余位置跳过对相对路径的重写，依赖浏览器通过 base 来解析相对 URL。
         preg_match('#<base[^>]*href=["\']([^"\']+)["\'][^>]*>#i', $html, $m);
         $skipRelative = count($m) > 0;
+        if ($skipRelative) {
+            $html = preg_replace(
+                '#(<base[^>]*href=["\'])([^"\']+)(["\'][^>]*>)#i',
+                '$1' . $this->rewriteUrl($m[1]) . '$3',
+                $html,
+                1
+            ) ?? $html;
+        }
 
         // 1. 注入请求 hook 脚本（在 <head> 标签之后立即插入）
         $hookScript = $this->buildHookScript();
         $html = preg_replace('#<head[^>]*>#i', '$0' . $hookScript, $html, 1);
 
-        // 2. 重写 src / href / action 属性
+        // 2. 重写 src / href / action / data-src 属性
         $html = preg_replace_callback(
-            '#\s(src|href|action)=["\']([^"\']+)["\']#i',
+            '#\s(src|href|action|data-src)=["\']([^"\']+)["\']#i',
             function ($m) use ($skipRelative) {
                 $attr = $m[1];
                 $val = $m[2];
@@ -297,6 +305,21 @@ class ContentRewriter
         foreach ($this->targetOrigins as $origin) {
             $content = str_replace($origin, $replacement, $content);
         }
+
+        $prefix = $this->prefix;
+        $content = preg_replace_callback(
+            '#(["\'])(/[^"\']*)\1#',
+            function (array $m) use ($prefix): string {
+                $path = $m[2];
+                if ($path === '/' || str_starts_with($path, $prefix . '/') || $path === $prefix) {
+                    return $m[0];
+                }
+
+                return $m[1] . $prefix . $path . $m[1];
+            },
+            $content
+        );
+
         return $content;
     }
 
@@ -341,6 +364,10 @@ class ContentRewriter
 
         // 3. 绝对路径（/path）
         if (str_starts_with($url, '/')) {
+            if (str_starts_with($url, $this->prefix . '/') || $url === $this->prefix) {
+                return $url;
+            }
+
             return $this->prefix . $url;
         }
 

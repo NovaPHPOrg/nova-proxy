@@ -7,6 +7,10 @@
         if (!url || typeof url !== 'string') return url;
         url = url.trim();
 
+        if (url.startsWith(PROXY_PREFIX + '/') || url === PROXY_PREFIX) {
+            return url;
+        }
+
         if (url === '' ||
             url.startsWith('#') ||
             url.startsWith('data:') ||
@@ -29,6 +33,9 @@
 
         if (url.startsWith(CURRENT_ORIGIN + '/')) {
             var localPath = url.substring(CURRENT_ORIGIN.length);
+            if (localPath.startsWith(PROXY_PREFIX + '/') || localPath === PROXY_PREFIX) {
+                return localPath;
+            }
             return PROXY_PREFIX + localPath;
         }
 
@@ -76,6 +83,43 @@
         }
         return origOpen.call(window, url, target, features);
     };
+
+    var URL_ATTRS = { src: 1, href: 1, action: 1, 'data-src': 1, 'data-href': 1 };
+    var origSetAttribute = Element.prototype.setAttribute;
+    Element.prototype.setAttribute = function(name, value) {
+        if (typeof value === 'string' && URL_ATTRS[String(name).toLowerCase()]) {
+            value = rewriteUrl(value);
+        }
+        return origSetAttribute.call(this, name, value);
+    };
+
+    function hookUrlProperty(proto, prop) {
+        var desc = Object.getOwnPropertyDescriptor(proto, prop);
+        if (!desc || !desc.set) {
+            return;
+        }
+        Object.defineProperty(proto, prop, {
+            get: desc.get,
+            set: function(val) {
+                desc.set.call(this, rewriteUrl(String(val)));
+            },
+            configurable: true,
+            enumerable: desc.enumerable
+        });
+    }
+
+    if (window.HTMLScriptElement) {
+        hookUrlProperty(HTMLScriptElement.prototype, 'src');
+    }
+    if (window.HTMLLinkElement) {
+        hookUrlProperty(HTMLLinkElement.prototype, 'href');
+    }
+    if (window.HTMLImageElement) {
+        hookUrlProperty(HTMLImageElement.prototype, 'src');
+    }
+    if (window.HTMLFormElement) {
+        hookUrlProperty(HTMLFormElement.prototype, 'action');
+    }
 
     function waitForElement(selector, timeout, interval) {
         timeout = timeout || 10000;
