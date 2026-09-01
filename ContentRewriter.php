@@ -311,7 +311,10 @@ class ContentRewriter
             '#(["\'])(/[^"\']*)\1#',
             function (array $m) use ($prefix): string {
                 $path = $m[2];
-                if ($path === '/' || str_starts_with($path, $prefix . '/') || $path === $prefix) {
+                if ($path === '/' ||
+                    str_starts_with($path, '//') ||
+                    str_starts_with($path, $prefix . '/') ||
+                    $path === $prefix) {
                     return $m[0];
                 }
 
