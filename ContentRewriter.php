@@ -210,6 +210,25 @@ class ContentRewriter
             $html
         );
 
+        // 5. meta refresh 跳转
+        $html = preg_replace_callback(
+            '#<meta\b[^>]*http-equiv=["\']refresh["\'][^>]*content=["\']([^"\']+)["\'][^>]*>#i',
+            function ($m) {
+                $content = preg_replace_callback(
+                    '#url=(.+)$#i',
+                    fn ($u) => 'url=' . $this->rewriteUrl(trim($u[1], " \t'\"")),
+                    $m[1]
+                );
+                return preg_replace(
+                    '#content=["\'][^"\']+["\']#i',
+                    'content="' . $content . '"',
+                    $m[0],
+                    1
+                ) ?? $m[0];
+            },
+            $html
+        );
+
         return $html;
     }
 
@@ -226,6 +245,11 @@ class ContentRewriter
         $jsFile = __DIR__ . '/hook.js';
         $js = file_get_contents($jsFile);
         $js = str_replace('{{PREFIX}}', $this->prefix, $js);
+        $js = str_replace(
+            '{{TARGET_ORIGINS}}',
+            json_encode($this->targetOrigins, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
+            $js
+        );
         return '<script>' . $js . '</script>';
     }
 

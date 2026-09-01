@@ -213,11 +213,21 @@ class HttpResponseReader
     public function decode(string $data, string $encoding): ?string
     {
         if ($encoding === 'gzip') {
-            $decoded = @gzdecode($data);
+            if ($data === '') {
+                return '';
+            }
+            // 头标 gzip 但 body 已是明文（或损坏）时，禁止对明文再 gzdecode
+            if (!str_starts_with($data, "\x1f\x8b")) {
+                return $data;
+            }
+            $decoded = gzdecode($data);
             return $decoded !== false ? $decoded : null;
         }
 
         if ($encoding === 'deflate') {
+            if ($data === '') {
+                return '';
+            }
             $decoded = @gzinflate($data);
             if ($decoded === false) {
                 $decoded = @gzuncompress($data);

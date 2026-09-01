@@ -110,7 +110,18 @@ class ProxyUrlRewriter
 
     private function isSameHost(string $host): bool
     {
-        return $host === $this->targetUrl['host'];
+        $host = strtolower($host);
+        $target = strtolower($this->targetUrl['host']);
+        if ($host === $target) {
+            return true;
+        }
+
+        return $this->stripWww($host) === $this->stripWww($target);
+    }
+
+    private function stripWww(string $host): string
+    {
+        return preg_replace('/^www\./i', '', $host) ?? $host;
     }
 
     /**

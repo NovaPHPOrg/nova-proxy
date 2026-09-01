@@ -304,14 +304,6 @@ class ProxyResponse extends Response
             $body = $decoded;
         }
 
-        if ($headers['encoding'] !== '') {
-            $decoded = $this->responseReader->decode($body, $headers['encoding']);
-            if ($decoded === null) {
-                throw new ProxyException('Failed to decode Content-Encoding: ' . $headers['encoding']);
-            }
-            $body = $decoded;
-        }
-
         $contentType = $this->getContentType($headers['lines']);
         if (self::isTextual($contentType)) {
             $charset = CharsetNormalizer::detect($contentType, $body);
