@@ -289,22 +289,23 @@ class ProxyResponse extends Response
 
     private function processResponseBody(string $body, array $headers): string
     {
-        // 解码 chunked
+        // 先拆 chunked，再解压。顺序反了会把 gzip 当 HTML，浏览器直接乱码。
         if ($headers['chunked']) {
             $body = $this->responseReader->decodeChunked($body);
         }
 
-        // 解压 gzip/deflate
         if ($headers['encoding'] !== '') {
-            $body = $this->responseReader->decode($body, $headers['encoding']);
+            $decoded = $this->responseReader->decode($body, $headers['encoding']);
+            if ($decoded === null) {
+                throw new ProxyException('Failed to decode Content-Encoding: ' . $headers['encoding']);
+            }
+            $body = $decoded;
         }
 
-        // 重写内容中的链接
         $contentType = $this->getContentType($headers['lines']);
         $this->contentRewriter->setCurrentPath($this->currentPath);
         $body = $this->contentRewriter->rewrite($body, $contentType);
 
-        // 自定义注入
         if ($this->responseInjector) {
             $body = ($this->responseInjector)($body, $headers['lines'], $this->currentPath);
         }
@@ -324,32 +325,40 @@ class ProxyResponse extends Response
 
     private function sendResponseToClient(array $headers, string $body): void
     {
-        // 发送响应头（重写 Location 和 Cookie）
+        // 禁止 PHP 再压一层；否则 Content-Length/Encoding 全错，页面直接乱码
+        if (ini_get('zlib.output_compression')) {
+            ini_set('zlib.output_compression', '0');
+        }
+        while (ob_get_level() > 0) {
+            ob_end_clean();
+        }
+
+        // 重写后的 body 已是明文。禁止再标 Content-Encoding:gzip，
+        // 否则叠加 PHP zlib.output_compression 会双重压缩 → 浏览器乱码。
         foreach ($headers['lines'] as $line) {
+            if (stripos($line, 'Content-Encoding:') === 0) {
+                continue;
+            }
+            if (stripos($line, 'Content-Length:') === 0) {
+                continue;
+            }
+            if (stripos($line, 'Transfer-Encoding:') === 0) {
+                continue;
+            }
+
             if (stripos($line, 'Location:') === 0) {
                 $location = trim(substr($line, 9));
-                $newLocation = $this->urlRewriter->rewriteLocation($location);
-                header('Location: ' . $newLocation);
+                header('Location: ' . $this->urlRewriter->rewriteLocation($location));
             } elseif (stripos($line, 'Set-Cookie:') === 0) {
-                $cookie = $this->urlRewriter->rewriteCookie($line);
-                header($cookie, false);
+                header($this->urlRewriter->rewriteCookie($line), false);
             } else {
                 header($line);
             }
         }
 
-        // 重新压缩为 gzip（统一输出格式）
-        if ($headers['encoding'] !== '') {
-            $body = $this->responseReader->encodeGzip($body);
-            header('Content-Encoding: gzip', true);
-        } else {
-            header_remove('Content-Encoding');
-        }
-
-        // 发送正确的长度
+        header_remove('Content-Encoding');
         header('Content-Length: ' . strlen($body), true);
 
-        // 输出
         echo $body;
         flush();
     }

@@ -63,24 +63,29 @@ class HttpRequestBuilder
 
     private function buildHeaders(array $urlInfo): string
     {
-
-        $host = $urlInfo['host'].(isset($urlInfo['port']) ? ':'.$urlInfo['port'] : '');
-
+        $scheme = strtolower((string)($urlInfo['scheme'] ?? 'http'));
+        $defaultPort = $scheme === 'https' ? 443 : 80;
+        $port = (int)($urlInfo['port'] ?? $defaultPort);
+        $host = (string)$urlInfo['host'];
+        // 默认端口不要写进 Host，部分 CDN/源站会回奇怪页面
+        if ($port !== $defaultPort) {
+            $host .= ':' . $port;
+        }
 
         $out = "Host: {$host}\r\n";
 
         foreach ($_SERVER as $k => $v) {
-            if (!str_starts_with($k, 'HTTP_') ) {
+            if (!str_starts_with($k, 'HTTP_')) {
                 continue;
             }
 
             if ($k === 'HTTP_HOST') {
-                continue; // 已经单独处理 Host 头，避免重复
+                continue;
             }
 
             $headerName = str_replace('_', '-', substr($k, 5));
 
-            // 强制只接受 gzip，PHP 没有内置 brotli 解码
+            // 强制只接受 gzip/deflate，PHP 没有内置 brotli 解码
             if ($headerName === 'ACCEPT-ENCODING') {
                 $out .= "Accept-Encoding: gzip, deflate\r\n";
                 continue;

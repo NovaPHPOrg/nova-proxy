@@ -207,32 +207,24 @@ class HttpResponseReader
     }
 
     /**
-     * 解压内容（gzip/deflate）
+     * 解压内容（gzip/deflate）。
+     * 失败返回 null，禁止把压缩字节当 HTML 往下传（那就是乱码源头）。
      */
-    public function decode(string $data, string $encoding): string
+    public function decode(string $data, string $encoding): ?string
     {
         if ($encoding === 'gzip') {
             $decoded = @gzdecode($data);
-            return $decoded !== false ? $decoded : $data;
+            return $decoded !== false ? $decoded : null;
         }
 
         if ($encoding === 'deflate') {
-            // deflate 可能是 raw deflate 或 zlib wrapped
             $decoded = @gzinflate($data);
             if ($decoded === false) {
                 $decoded = @gzuncompress($data);
             }
-            return $decoded !== false ? $decoded : $data;
+            return $decoded !== false ? $decoded : null;
         }
 
         return $data;
-    }
-
-    /**
-     * 压缩为 gzip
-     */
-    public function encodeGzip(string $data): string
-    {
-        return gzencode($data);
     }
 }
