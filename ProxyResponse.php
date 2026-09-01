@@ -256,8 +256,10 @@ class ProxyResponse extends Response
         $headersResult = $this->responseReader->readHeadersOnly($socket);
         $headers = $headersResult;
 
-        // 判断是否需要内容重写（仅 text/html、text/css 需要）
-        if (!$headers['needsRewrite'] && !$this->responseInjector) {
+        // 仅 HTML 需要注入（返回按钮 / 调试工具）；勿因 injector 缓冲图片等二进制
+        $needBuffer = $headers['needsRewrite']
+            || ($this->responseInjector !== null && !empty($headers['html']));
+        if (!$needBuffer) {
             // 流式模式：直接转发响应头和响应体，不缓冲
             $this->sendStreamHeaders($headers);
             $this->responseReader->streamToClient($socket, $headers);
@@ -302,7 +304,26 @@ class ProxyResponse extends Response
             $body = $decoded;
         }
 
+        if ($headers['encoding'] !== '') {
+            $decoded = $this->responseReader->decode($body, $headers['encoding']);
+            if ($decoded === null) {
+                throw new ProxyException('Failed to decode Content-Encoding: ' . $headers['encoding']);
+            }
+            $body = $decoded;
+        }
+
         $contentType = $this->getContentType($headers['lines']);
+        if (self::isTextual($contentType)) {
+            $charset = CharsetNormalizer::detect($contentType, $body);
+            if ($charset !== 'UTF-8') {
+                $body = CharsetNormalizer::toUtf8($body, $charset);
+                CharsetNormalizer::applyUtf8Headers($headers['lines']);
+                if (str_contains(strtolower($contentType), 'text/html')) {
+                    $body = CharsetNormalizer::applyUtf8Meta($body);
+                }
+            }
+        }
+
         $this->contentRewriter->setCurrentPath($this->currentPath);
         $body = $this->contentRewriter->rewrite($body, $contentType);
 
@@ -321,6 +342,15 @@ class ProxyResponse extends Response
             }
         }
         return 'text/plain';
+    }
+
+    private static function isTextual(string $contentType): bool
+    {
+        $ct = strtolower($contentType);
+        return str_starts_with($ct, 'text/')
+            || str_contains($ct, 'json')
+            || str_contains($ct, 'javascript')
+            || str_contains($ct, 'xml');
     }
 
     private function sendResponseToClient(array $headers, string $body): void
